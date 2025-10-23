@@ -75,6 +75,55 @@ alter table public.vehicles        enable row level security;
 alter table public.vehicle_sessions enable row level security;
 alter table public.vehicle_live     enable row level security;
 
+-- ---------------------------------------------------------
+-- Platform admins (global privileges across all companies)
+-- ---------------------------------------------------------
+create table if not exists public.platform_admins (
+  user_id    uuid primary key,
+  created_at timestamptz not null default now()
+);
+
+alter table public.platform_admins enable row level security;
+
+-- Optional: users can read their own admin marker (or restrict to service role only)
+do $$ begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='platform_admins' and policyname='read own admin flag'
+  ) then
+    create policy "read own admin flag"
+      on public.platform_admins
+      for select to authenticated
+      using (user_id = auth.uid());
+  end if;
+end $$;
+
+-- ---------------------------------------------------------
+-- Company membership (for owner/admin access)
+-- ---------------------------------------------------------
+create table if not exists public.company_users (
+  user_id    uuid not null,
+  company_id uuid not null references public.companies(id) on delete cascade,
+  role       text not null check (role in ('owner','admin','member')),
+  created_at timestamptz not null default now(),
+  primary key (user_id, company_id)
+);
+
+alter table public.company_users enable row level security;
+
+-- Owners/admins can read their memberships
+do $$ begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='company_users' and policyname='read own memberships'
+  ) then
+    create policy "read own memberships"
+      on public.company_users
+      for select to authenticated
+      using (user_id = auth.uid());
+  end if;
+end $$;
+
 -- Public read for vehicle directory (lookup by code) — MVP
 do $$ begin
   if not exists (

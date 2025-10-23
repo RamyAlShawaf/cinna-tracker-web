@@ -6,33 +6,12 @@ const TileLayer = dynamic(() => import('react-leaflet').then(m => m.TileLayer), 
 const Marker = dynamic(() => import('react-leaflet').then(m => m.Marker), { ssr: false }) as any;
 const Popup = dynamic(() => import('react-leaflet').then(m => m.Popup), { ssr: false }) as any;
 import 'leaflet/dist/leaflet.css';
-import L from 'leaflet';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
-const isRetina = typeof window !== 'undefined' && window.devicePixelRatio > 1;
-const defaultIcon = new L.Icon({
-    iconUrl: isRetina
-        ? 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png'
-        : 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-    shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
-    iconSize: [25, 41],
-    iconAnchor: [12, 41],
-    popupAnchor: [1, -34],
-    shadowSize: [41, 41],
-});
-
-// Sleek pulsing circle marker icon
-const pulseIcon = L.divIcon({
-    className: 'pulse-icon',
-    html: '<div class="pulse-dot"></div>',
-    iconSize: [28, 28],
-    iconAnchor: [14, 14],
-    popupAnchor: [0, -12],
-});
-
 interface TrackClientProps {
 	code: string;
+	showInput?: boolean;
 }
 
 interface LivePoint {
@@ -44,26 +23,60 @@ interface LivePoint {
 	ts?: string;
 }
 
-export default function TrackClient({ code }: TrackClientProps) {
+export default function TrackClient({ code, showInput = true }: TrackClientProps) {
 	const [point, setPoint] = useState<LivePoint | null>(null);
 	const [vehicleId, setVehicleId] = useState<string | null>(null);
+	const [vehicleLabel, setVehicleLabel] = useState<string | null>(null);
 	const [status, setStatus] = useState<string>('');
-  const mapRef = useRef<any>(null);
-    const maptilerKey = process.env.NEXT_PUBLIC_MAPTILER_KEY;
-    const mapStyle = process.env.NEXT_PUBLIC_MAP_STYLE || 'basic-v2-dark';
-    const usingMapTiler = !!maptilerKey;
-    const tileUrl = usingMapTiler
-        ? `https://api.maptiler.com/maps/${mapStyle}/{z}/{x}/{y}@2x.png?key=${maptilerKey}`
-        : 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-    const attribution = usingMapTiler
-        ? '&copy; <a href="https://www.maptiler.com/copyright/">MapTiler</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        : '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+	const [leaflet, setLeaflet] = useState<any>(null);
+	const [isDark, setIsDark] = useState(true);
+	const mapRef = useRef<any>(null);
+	const maptilerKey = process.env.NEXT_PUBLIC_MAPTILER_KEY;
+	const mapStyleDark = process.env.NEXT_PUBLIC_MAP_STYLE_DARK || process.env.NEXT_PUBLIC_MAP_STYLE || 'basic-v2-dark';
+	const mapStyleLight = process.env.NEXT_PUBLIC_MAP_STYLE_LIGHT || 'basic-v2';
+	const usingMapTiler = !!maptilerKey;
+
+	// React to system theme to pick map style
+	useEffect(() => {
+		const mq = window.matchMedia('(prefers-color-scheme: dark)');
+		setIsDark(mq.matches);
+		const handler = (e: MediaQueryListEvent) => setIsDark(e.matches);
+		mq.addEventListener('change', handler);
+		return () => mq.removeEventListener('change', handler);
+	}, []);
+
+	const tileUrl = usingMapTiler
+		? `https://api.maptiler.com/maps/${isDark ? mapStyleDark : mapStyleLight}/{z}/{x}/{y}@2x.png?key=${maptilerKey}`
+		: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+	const attribution = usingMapTiler
+		? '&copy; <a href="https://www.maptiler.com/copyright/">MapTiler</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+		: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 	const supabase = useMemo(() => {
 		const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 		const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 		return createClient(url, anon);
 	}, []);
 	const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+	useEffect(() => {
+		let mounted = true;
+		(async () => {
+			const mod = await import('leaflet');
+			if (mounted) setLeaflet((mod as any).default ?? mod);
+		})();
+		return () => { mounted = false; };
+	}, []);
+
+	const pulseIcon = useMemo(() => {
+		if (!leaflet) return null;
+		return leaflet.divIcon({
+			className: 'pulse-icon',
+			html: '<div class="pulse-dot"></div>',
+			iconSize: [28, 28],
+			iconAnchor: [14, 14],
+			popupAnchor: [0, -12],
+		});
+	}, [leaflet]);
 
 	useEffect(() => {
 		let mounted = true;
@@ -75,25 +88,24 @@ export default function TrackClient({ code }: TrackClientProps) {
 				const data = await r.json();
 				if (mounted) setPoint(data);
 			}
-			// Lookup vehicle id for realtime subscription via Postgres changes
 			const { data: v } = await supabase
 				.from('vehicles')
-				.select('id')
+				.select('id,label')
 				.eq('public_code', code)
 				.single();
-			if (v?.id && mounted) setVehicleId(v.id);
+			if (v?.id && mounted) {
+				setVehicleId(v.id);
+				setVehicleLabel((v as any).label || null);
+			}
 			setStatus('');
 		}
 		prime();
-		return () => {
-			mounted = false;
-		};
+		return () => { mounted = false; };
 	// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [code]);
 
 	useEffect(() => {
 		if (!vehicleId) return;
-		// Subscribe to Postgres changes on vehicle_live for this vehicle
 		const channel = supabase
 			.channel(`live:${vehicleId}`)
 			.on(
@@ -114,7 +126,6 @@ export default function TrackClient({ code }: TrackClientProps) {
 			)
 			.subscribe();
 
-		// Fallback: mark offline if no updates for 60s
 		timerRef.current && clearInterval(timerRef.current);
 		timerRef.current = setInterval(() => {
 			if (!point?.ts) return;
@@ -130,99 +141,99 @@ export default function TrackClient({ code }: TrackClientProps) {
 	// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [vehicleId, supabase]);
 
-  useEffect(() => {
-    if (mapRef.current && point) {
-      mapRef.current.setView([point.lat, point.lng], 15);
-    }
-  }, [point]);
+	useEffect(() => {
+		if (mapRef.current && point) {
+			mapRef.current.setView([point.lat, point.lng], 15);
+		}
+	}, [point]);
+
+	const waiting = (
+		<div className="absolute inset-0" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+			<span className="text-sm text-muted">Waiting for first location…</span>
+		</div>
+	);
+
+	const infoOverlay = point ? (
+		<div className="absolute left-0 right-0 bottom-0 p-0 sm:p-4 z-[401]" aria-live="polite">
+			<div className="w-full sm:max-w-xl sm:mx-auto card card-contrast px-4 py-6 sm:p-4 flex items-center justify-between gap-4 rounded-b-none sm:rounded-t-xl sm:rounded-b-xl track-info-card">
+				<div className="min-w-0">
+					<div className="text-sm text-muted">Vehicle</div>
+					<div className="font-medium truncate">{vehicleLabel || code}</div>
+				</div>
+				<div className="flex flex-wrap sm:flex-nowrap items-center gap-x-4 gap-y-1 sm:gap-6 text-sm">
+					<div>
+						<span className="text-muted">Last:</span>{' '}
+						{point.ts ? new Date(point.ts).toLocaleTimeString() : '—'}
+					</div>
+				</div>
+			</div>
+		</div>
+	) : null;
 
 	return (
-		<div className="w-full h-full">
-			<div className="mb-2 flex items-center gap-3">
-				<input
-					defaultValue={code}
-					placeholder="Enter vehicle code (e.g., ONX-102)"
-					className="border rounded px-3 py-2"
-					onKeyDown={(e) => {
-						if (e.key === 'Enter') {
-							const target = e.target as HTMLInputElement;
-							const newCode = target.value.trim();
-							if (newCode) window.location.search = `?v=${encodeURIComponent(newCode)}`;
-						}
+		<div className="w-full h-full relative">
+			{showInput && (
+				<div className="absolute left-0 right-0 top-0 p-4 flex flex-wrap items-center gap-3 z-[401]" suppressHydrationWarning>
+					<input
+						defaultValue={code}
+						placeholder="Enter vehicle code (e.g., ONX-102)"
+						className="input max-w-xs"
+						onKeyDown={(e) => {
+							if (e.key === 'Enter') {
+								const target = (e.target as HTMLInputElement);
+								const newCode = target.value.trim();
+								if (newCode) window.location.href = `/track/${encodeURIComponent(newCode)}`;
+							}
+						}}
+					/>
+					<div className="text-sm text-muted">{status}</div>
+				</div>
+			)}
+			{!point || !pulseIcon ? (
+				waiting
+			) : (
+				<MapContainer
+					center={[point.lat, point.lng] as [number, number]}
+					zoom={15}
+					zoomControl={false}
+					attributionControl={false}
+					whenCreated={(m: any) => {
+						mapRef.current = m;
+						m.setView([point.lat, point.lng], 15);
 					}}
-				/>
-				<div className="text-sm text-gray-600">{status}</div>
-			</div>
-      {!point ? (
-        <div style={{ height: 'calc(100% - 40px)', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <span className="text-sm text-gray-600">Waiting for first location…</span>
-        </div>
-      ) : (
-        <MapContainer
-          center={[point.lat, point.lng] as [number, number]}
-          zoom={15}
-          whenCreated={(m: any) => {
-            mapRef.current = m;
-            m.setView([point.lat, point.lng], 15);
-          }}
-          style={{ height: 'calc(100% - 40px)', width: '100%' }}
-        >
-          <TileLayer
-            attribution={attribution}
-            url={tileUrl}
-            detectRetina={!usingMapTiler}
-            tileSize={usingMapTiler ? 512 : undefined as any}
-            zoomOffset={usingMapTiler ? -1 : undefined as any}
-          />
-          <Marker position={[point.lat, point.lng] as [number, number]} icon={pulseIcon}>
-            <Popup>
-              <div className="text-sm">
-                <div>Lat: {point.lat.toFixed(5)}, Lng: {point.lng.toFixed(5)}</div>
-                {point.speed != null && <div>Speed: {Math.round(point.speed)} m/s</div>}
-                {point.ts && <div>Last seen: {new Date(point.ts).toLocaleTimeString()}</div>}
-              </div>
-            </Popup>
-          </Marker>
-        </MapContainer>
-      )}
-      <style jsx global>{`
-        /* Make Leaflet divIcon transparent */
-        .leaflet-div-icon.pulse-icon {
-          background: transparent;
-          border: none;
-        }
-        .pulse-icon .pulse-dot {
-          width: 18px;
-          height: 18px;
-          background: #14b8a6; /* teal-500 */
-          border: 2px solid #ffffff;
-          border-radius: 9999px;
-          box-shadow: 0 0 0 rgba(20, 184, 166, 0.5);
-          position: relative;
-        }
-        .pulse-icon .pulse-dot::after {
-          content: '';
-          position: absolute;
-          left: 50%;
-          top: 50%;
-          width: 100%;
-          height: 100%;
-          border-radius: 9999px;
-          transform: translate(-50%, -50%) scale(1);
-          background: rgba(20, 184, 166, 0.35);
-          animation: pulse-ring 1.8s ease-out infinite;
-        }
-        @keyframes pulse-ring {
-          0% {
-            transform: translate(-50%, -50%) scale(1);
-            opacity: 0.75;
-          }
-          100% {
-            transform: translate(-50%, -50%) scale(2.8);
-            opacity: 0;
-          }
-        }
-      `}</style>
+					style={{ position: 'absolute', inset: 0 }}
+				>
+					<TileLayer
+						attribution={attribution}
+						url={tileUrl}
+						detectRetina={!usingMapTiler}
+						tileSize={usingMapTiler ? 512 : undefined as any}
+						zoomOffset={usingMapTiler ? -1 : undefined as any}
+					/>
+					<Marker position={[point.lat, point.lng] as [number, number]} icon={pulseIcon as any}>
+						<Popup>
+							<div className="text-sm">
+								<div>Lat: {point.lat.toFixed(5)}, Lng: {point.lng.toFixed(5)}</div>
+								{point.speed != null && <div>Speed: {Math.round(point.speed)} m/s</div>}
+								{point.ts && <div>Last seen: {new Date(point.ts).toLocaleTimeString()}</div>}
+							</div>
+						</Popup>
+					</Marker>
+				</MapContainer>
+			)}
+			{infoOverlay}
+			<style jsx global>{`
+				.leaflet-div-icon.pulse-icon { background: transparent; border: none; }
+				.pulse-icon .pulse-dot { width: 18px; height: 18px; background: #14b8a6; border: 2px solid #ffffff; border-radius: 9999px; box-shadow: 0 0 0 rgba(20, 184, 166, 0.5); position: relative; }
+				.pulse-icon .pulse-dot::after { content: ''; position: absolute; left: 50%; top: 50%; width: 100%; height: 100%; border-radius: 9999px; transform: translate(-50%, -50%) scale(1); background: rgba(20, 184, 166, 0.35); animation: pulse-ring 1.8s ease-out infinite; }
+				@keyframes pulse-ring { 0% { transform: translate(-50%, -50%) scale(1); opacity: 0.75; } 100% { transform: translate(-50%, -50%) scale(2.8); opacity: 0; } }
+				/* Hide Leaflet attribution overlay if it renders */
+				.leaflet-control-attribution { display: none !important; }
+				/* Remove bottom radius on small screens and in-app webviews */
+				@media (max-width: 639px) {
+					.track-info-card { border-bottom-left-radius: 0 !important; border-bottom-right-radius: 0 !important; }
+				}
+			`}</style>
 		</div>
 	);
 }

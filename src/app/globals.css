@@ -1,26 +1,119 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #0b0c0f;
+  --foreground: #e7e9ee;
+  --muted: #9aa3b2;
+  --card: #0f1115;
+  --card-contrast: #12151b;
+  --border: #1b1f2a;
+  --ring: #22c55e;
+  --accent: #10b981;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-card: var(--card);
+  --color-card-contrast: var(--card-contrast);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --color-accent: var(--accent);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
+@media (prefers-color-scheme: light) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --background: #ffffff;
+    --foreground: #0a0a0a;
+    --muted: #4b5563;
+    --card: #ffffff;
+    --card-contrast: #f8fafc;
+    --border: #e5e7eb;
+    --ring: #16a34a;
+    --accent: #059669;
   }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Ubuntu, Cantarell, Helvetica Neue, Arial, "Apple Color Emoji", "Segoe UI Emoji";
 }
+
+/* Typography */
+.prose-title {
+  letter-spacing: -0.02em;
+}
+
+/* Cards */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.card-contrast {
+  background: var(--card-contrast);
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  height: 2.5rem;
+  padding: 0 1rem;
+  border-radius: 9999px;
+  font-weight: 600;
+}
+.btn-primary {
+  background: var(--foreground);
+  color: var(--background);
+}
+.btn-primary:hover { filter: brightness(0.9); }
+.btn-outline {
+  border: 1px solid var(--border);
+  background: transparent;
+}
+.btn-outline:hover { background: rgba(255,255,255,0.04); }
+
+/* Inputs */
+.input {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.5rem 0.75rem;
+}
+.input:focus {
+  outline: none;
+  border-color: var(--ring);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring), transparent 75%);
+}
+
+/* Tables */
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.table th, .table td {
+  padding: 0.5rem 0.75rem;
+}
+.table thead tr { border-bottom: 1px solid var(--border); }
+.table tbody tr { border-bottom: 1px solid var(--border); }
+
+/* Utility */
+.container-max { max-width: 72rem; margin: 0 auto; }
+.ring-accent { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent), transparent 75%); }
+
+/* Leaflet map background harmonize */
+.leaflet-container { background: var(--card-contrast); }
