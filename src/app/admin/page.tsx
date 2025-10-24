@@ -6,15 +6,40 @@ import QRCode from 'qrcode';
 
 async function getVehicles(companyId?: string) {
   const supabase = supabaseServiceClient();
-  let q = supabase
-    .from('vehicle_with_live')
-    .select('*')
+
+  // 1) Fetch base vehicles
+  let vehicleQuery = supabase
+    .from('vehicles')
+    .select('id, label, public_code, created_at, company_id')
     .order('created_at', { ascending: false });
   if (companyId) {
-    q = q.eq('company_id', companyId);
+    vehicleQuery = vehicleQuery.eq('company_id', companyId);
   }
-  const { data } = await q;
-  return data || [];
+  const { data: vehicles } = await vehicleQuery;
+  if (!vehicles || vehicles.length === 0) return [] as any[];
+
+  // 2) Fetch live info and merge
+  const { data: live } = await supabase
+    .from('vehicle_live')
+    .select('vehicle_id, ts, status')
+    .in('vehicle_id', vehicles.map(v => v.id));
+
+  const liveByVehicleId = new Map<string, { ts: string | null; status: string | null }>();
+  for (const row of live || []) {
+    liveByVehicleId.set(String(row.vehicle_id), {
+      ts: (row as any).ts || null,
+      status: (row as any).status || null,
+    });
+  }
+
+  return vehicles.map(v => {
+    const liveInfo = liveByVehicleId.get(v.id) || { ts: null, status: null };
+    return {
+      ...v,
+      live_ts: liveInfo.ts,
+      status: liveInfo.status,
+    } as any;
+  });
 }
 
 async function qrDataUrl(code: string) {
@@ -204,14 +229,14 @@ export default async function AdminPage() {
               {vehicles.map(async (v: any) => {
                 const dataUrl = await qrDataUrl(v.public_code);
                 const last = v.live_ts ? new Date(v.live_ts as string) : null;
-                const status = v.status === 'paused' ? 'Paused' : 'Online';
+                const status = v.status === 'paused' ? 'Paused' : (v.status ? 'Online' : 'Offline');
                 const trackHref = `/track?v=${encodeURIComponent(v.public_code as string)}`;
                 return (
                   <tr key={v.id} className="align-top">
                     <td className="font-medium">{v.label}</td>
                     <td className="font-mono">{v.public_code}</td>
                     <td>
-                      <span className={status === 'Online' ? 'text-emerald-500' : status === 'Paused' ? 'text-yellow-600' : 'text-muted'}>{status}</span>
+                      <span className={status === 'Online' ? 'text-emerald-500' : status === 'Paused' ? 'text-yellow-600' : 'text-red-600'}>{status}</span>
                     </td>
                     <td>{last ? last.toLocaleString() : '—'}</td>
                     <td>

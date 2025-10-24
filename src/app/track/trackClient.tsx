@@ -84,10 +84,16 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		async function prime() {
 			if (!code) return;
 			setStatus('Loading last position…');
-      const r = await fetch(`/api/vehicle/${encodeURIComponent(code)}/last`);
+			const r = await fetch(`/api/vehicle/${encodeURIComponent(code)}/last`);
 			if (r.ok) {
 				const data = await r.json();
 				if (mounted) setPoint(data);
+			} else {
+				// No live row -> offline
+				if (mounted) {
+					setPoint(null);
+					setStatus('Offline');
+				}
 			}
 			const { data: v } = await supabase
 				.from('vehicles')
@@ -98,7 +104,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 				setVehicleId(v.id);
 				setVehicleLabel((v as any).label || null);
 			}
-			setStatus('');
+			if (mounted && status === 'Loading last position…') setStatus('');
 		}
 		prime();
 		return () => { mounted = false; };
@@ -113,17 +119,24 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
         'postgres_changes',
 				{ event: '*', schema: 'public', table: 'vehicle_live', filter: `vehicle_id=eq.${vehicleId}` },
 				(payload: any) => {
-					const row = (payload.new || payload.record) as any;
-					if (!row) return;
+					const eventType = (payload.eventType || payload.type || '').toUpperCase();
+					if (eventType === 'DELETE') {
+						setPoint(null);
+						setStatus('Offline');
+						return;
+					}
+					const row = (payload.new || payload.record || payload) as any;
+					if (!row || row.lat == null || row.lng == null) return;
 					setPoint({
 						lat: row.lat,
 						lng: row.lng,
 						speed: row.speed,
 						heading: row.heading,
 						accuracy: row.accuracy,
-            status: row.status,
+						status: row.status,
 						ts: row.ts,
 					});
+					setStatus('');
 				}
 			)
 			.subscribe();
@@ -145,7 +158,9 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 
 	useEffect(() => {
 		if (mapRef.current && point) {
-			mapRef.current.setView([point.lat, point.lng], 15);
+			if (typeof point.lat === 'number' && typeof point.lng === 'number') {
+				mapRef.current.setView([point.lat, point.lng], 15);
+			}
 		}
 	}, [point]);
 
@@ -155,7 +170,16 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		</div>
 	);
 
-  const infoOverlay = point ? (
+	const offline = (
+		<div className="absolute inset-0" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+			<span className="text-sm text-muted">Vehicle is offline</span>
+		</div>
+	);
+
+	const hasCoords = !!(point && typeof point.lat === 'number' && typeof point.lng === 'number');
+	const statusLabel = point?.status === 'paused' ? 'Paused' : hasCoords ? 'Online' : 'Offline';
+
+	const infoOverlay = (
 		<div className="absolute left-0 right-0 bottom-0 p-0 sm:p-4 z-[401]" aria-live="polite">
 			<div className="w-full sm:max-w-xl sm:mx-auto card card-contrast px-4 py-6 sm:p-4 flex items-center justify-between gap-4 rounded-b-none sm:rounded-t-xl sm:rounded-b-xl track-info-card">
 				<div className="min-w-0">
@@ -165,20 +189,22 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 				<div className="flex flex-wrap sm:flex-nowrap items-center gap-x-4 gap-y-1 sm:gap-6 text-sm">
 					<div>
 						<span className="text-muted">Last:</span>{' '}
-						{point.ts ? new Date(point.ts).toLocaleTimeString() : '—'}
+						{point?.ts ? new Date(point.ts).toLocaleTimeString() : '—'}
 					</div>
-          <div>
-            <span className="text-muted">Status:</span>{' '}
-            {point.status === 'paused' ? (
-              <span className="text-yellow-600">Paused</span>
-            ) : (
-              <span className="text-emerald-600">Online</span>
-            )}
-          </div>
+					<div>
+						<span className="text-muted">Status:</span>{' '}
+						{statusLabel === 'Paused' ? (
+							<span className="text-yellow-600">Paused</span>
+						) : statusLabel === 'Online' ? (
+							<span className="text-emerald-600">Online</span>
+						) : (
+							<span className="text-red-600">Offline</span>
+						)}
+					</div>
 				</div>
 			</div>
 		</div>
-	) : null;
+	);
 
 	return (
 		<div className="w-full h-full relative">
@@ -199,17 +225,17 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 					<div className="text-sm text-muted">{status}</div>
 				</div>
 			)}
-			{!point || !pulseIcon ? (
-				waiting
+			{!hasCoords || !pulseIcon ? (
+				status === 'Offline' ? offline : waiting
 			) : (
 				<MapContainer
-					center={[point.lat, point.lng] as [number, number]}
+					center={[point!.lat, point!.lng] as [number, number]}
 					zoom={15}
 					zoomControl={false}
 					attributionControl={false}
 					whenCreated={(m: any) => {
 						mapRef.current = m;
-						m.setView([point.lat, point.lng], 15);
+						m.setView([point!.lat, point!.lng], 15);
 					}}
 					style={{ position: 'absolute', inset: 0 }}
 				>
@@ -220,12 +246,12 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 						tileSize={usingMapTiler ? 512 : undefined as any}
 						zoomOffset={usingMapTiler ? -1 : undefined as any}
 					/>
-					<Marker position={[point.lat, point.lng] as [number, number]} icon={pulseIcon as any}>
+					<Marker position={[point!.lat, point!.lng] as [number, number]} icon={pulseIcon as any}>
 						<Popup>
 							<div className="text-sm">
-								<div>Lat: {point.lat.toFixed(5)}, Lng: {point.lng.toFixed(5)}</div>
-								{point.speed != null && <div>Speed: {Math.round(point.speed)} m/s</div>}
-								{point.ts && <div>Last seen: {new Date(point.ts).toLocaleTimeString()}</div>}
+								<div>Lat: {Number(point!.lat).toFixed(5)}, Lng: {Number(point!.lng).toFixed(5)}</div>
+								{point!.speed != null && <div>Speed: {Math.round(point!.speed!)} m/s</div>}
+								{point!.ts && <div>Last seen: {new Date(point!.ts!).toLocaleTimeString()}</div>}
 							</div>
 						</Popup>
 					</Marker>
