@@ -204,14 +204,14 @@ export default async function AdminPage() {
               {vehicles.map(async (v: any) => {
                 const dataUrl = await qrDataUrl(v.public_code);
                 const last = v.live_ts ? new Date(v.live_ts as string) : null;
-                const status = last && (Date.now() - last.getTime()) < 2 * 60 * 1000 ? 'Online' : 'Offline';
+                const status = v.status === 'paused' ? 'Paused' : 'Online';
                 const trackHref = `/track?v=${encodeURIComponent(v.public_code as string)}`;
                 return (
                   <tr key={v.id} className="align-top">
                     <td className="font-medium">{v.label}</td>
                     <td className="font-mono">{v.public_code}</td>
                     <td>
-                      <span className={status === 'Online' ? 'text-emerald-500' : 'text-muted'}>{status}</span>
+                      <span className={status === 'Online' ? 'text-emerald-500' : status === 'Paused' ? 'text-yellow-600' : 'text-muted'}>{status}</span>
                     </td>
                     <td>{last ? last.toLocaleString() : '—'}</td>
                     <td>
