@@ -14,6 +14,8 @@ PUBLISH_JWT_TTL_HOURS=8
 DEFAULT_COMPANY_ID=
 ```
 
+Note: `ADMIN_JWT_SECRET` is no longer used. Sessions are handled via Supabase Auth cookies.
+
 2) Apply database schema in Supabase SQL editor using `supabase/schema.sql`.
 
 3) Run dev server:

@@ -3,7 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import Link from "next/link";
 import { getSession } from "@/lib/auth";
-import { cookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
 import { redirect } from "next/navigation";
 
 const geistSans = Geist({
@@ -46,7 +46,7 @@ export default async function RootLayout({
               {!isAuthed ? (
                 <Link href="/login" className="hover:opacity-80">Login</Link>
               ) : (
-                <form action={async () => { 'use server'; (await cookies()).delete('admin_token'); redirect('/login'); }}>
+                <form action={async () => { 'use server'; const res = await fetch('/api/auth/logout', { method: 'POST' }); redirect('/login'); }}>
                   <button className="hover:opacity-80" type="submit">Log out</button>
                 </form>
               )}

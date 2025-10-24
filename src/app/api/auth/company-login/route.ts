@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import { createClient } from '@supabase/supabase-js';
-import { SignJWT } from 'jose';
+import { createServerClient } from '@supabase/ssr';
+import { supabaseServiceClient } from '@/lib/supabaseServer';
 
 const bodySchema = z.object({
   email: z.string().email(),
@@ -19,8 +19,26 @@ export async function POST(req: NextRequest) {
     const json = await req.json();
     const { email, password } = bodySchema.parse(json);
 
-    // Sign in the user via Supabase Auth
-    const supabase = createClient(getEnv('NEXT_PUBLIC_SUPABASE_URL'), getEnv('SUPABASE_SERVICE_ROLE_KEY'));
+    // Create SSR client bound to response cookies
+    const res = NextResponse.json({ ok: true });
+    const supabase = createServerClient(
+      getEnv('NEXT_PUBLIC_SUPABASE_URL'),
+      getEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY'),
+      {
+        cookies: {
+          get(name: string) {
+            return req.cookies.get(name)?.value;
+          },
+          set(name: string, value: string, options: any) {
+            res.cookies.set({ name, value, ...options });
+          },
+          remove(name: string, options: any) {
+            res.cookies.set({ name, value: '', ...options });
+          },
+        },
+      }
+    );
+
     const { data: signInData, error: signInErr } = await supabase.auth.signInWithPassword({ email, password });
     if (signInErr || !signInData.user) {
       return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 });
@@ -29,14 +47,14 @@ export async function POST(req: NextRequest) {
     const userId = signInData.user.id;
 
     // Platform admin?
-    const { data: adminRow } = await supabase
+    const { data: adminRow } = await supabaseServiceClient()
       .from('platform_admins')
       .select('user_id')
       .eq('user_id', userId)
       .maybeSingle();
 
     // Look up company ownership membership — expects a table company_users(user_id uuid, company_id uuid, role text)
-    const { data: membership, error: mErr } = await supabase
+    const { data: membership, error: mErr } = await supabaseServiceClient()
       .from('company_users')
       .select('company_id, role')
       .eq('user_id', userId)
@@ -49,31 +67,7 @@ export async function POST(req: NextRequest) {
     }
 
     const isAdmin = !!adminRow;
-    const scope = isAdmin ? 'admin' : 'owner';
-
-    // Issue our cookie JWT containing scope and company_id
-    const secret = new TextEncoder().encode(getEnv('ADMIN_JWT_SECRET'));
-    const ttlHours = Number(process.env.ADMIN_JWT_TTL_HOURS || '24');
-    const exp = Math.floor(Date.now() / 1000) + ttlHours * 3600;
-    const tokenPayload: any = { scope, user_id: userId };
-    if (!isAdmin) tokenPayload.company_id = membership!.company_id;
-
-    const token = await new SignJWT(tokenPayload)
-      .setProtectedHeader({ alg: 'HS256' })
-      .setExpirationTime(exp)
-      .setIssuedAt()
-      .sign(secret);
-
-    const res = NextResponse.json(isAdmin ? { ok: true, admin: true } : { ok: true, company_id: membership!.company_id });
-    const isProd = process.env.NODE_ENV === 'production';
-    res.cookies.set('admin_token', token, {
-      httpOnly: true,
-      secure: isProd,
-      sameSite: 'lax',
-      path: '/',
-      maxAge: ttlHours * 3600,
-    });
-    return res;
+    return NextResponse.json(isAdmin ? { ok: true, admin: true } : { ok: true, company_id: membership!.company_id }, { headers: res.headers });
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'Bad Request' }, { status: 400 });
   }
