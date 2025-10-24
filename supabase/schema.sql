@@ -51,8 +51,13 @@ create table if not exists public.vehicle_live (
   speed      double precision,
   heading    double precision,
   accuracy   double precision,
+  status     text not null default 'online' check (status in ('online','paused')),
   ts         timestamptz not null default now()
 );
+
+-- Ensure status column exists for existing databases created before this change
+alter table if exists public.vehicle_live
+  add column if not exists status text not null default 'online' check (status in ('online','paused'));
 
 -- Optional: auto-refresh ts on updates
 create or replace function public._touch_vehicle_live_ts()
@@ -294,24 +299,61 @@ begin
   end if;
 
   -- Upsert latest position
-  insert into public.vehicle_live (vehicle_id, lat, lng, speed, heading, accuracy, ts)
-  values (v_vehicle_id, p_lat, p_lng, p_speed, p_heading, p_accuracy, now())
+  insert into public.vehicle_live (vehicle_id, lat, lng, speed, heading, accuracy, status, ts)
+  values (v_vehicle_id, p_lat, p_lng, p_speed, p_heading, p_accuracy, 'online', now())
   on conflict (vehicle_id) do update
     set lat      = excluded.lat,
         lng      = excluded.lng,
         speed    = excluded.speed,
         heading  = excluded.heading,
         accuracy = excluded.accuracy,
+        status   = 'online',
         ts       = excluded.ts;
 end $$;
 
 grant execute on function public.publish_vehicle_live(uuid, double precision, double precision, double precision, double precision, double precision)
   to authenticated;
 
--- ---------------------------------------------------------
--- Admin-facing convenience view (optional)
--- ---------------------------------------------------------
-create or replace view public.vehicle_with_live as
+-- Allow operators to explicitly set status (e.g., pause/resume) without sending a location
+create or replace function public.set_vehicle_status(
+  p_session_id uuid,
+  p_status     text
+) returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_vehicle_id uuid;
+begin
+  if p_status not in ('online','paused') then
+    raise exception 'Invalid status';
+  end if;
+
+  -- Verify session belongs to the caller and is active
+  select s.vehicle_id
+    into v_vehicle_id
+  from public.vehicle_sessions s
+  where s.id = p_session_id
+    and s.ended_at is null
+    and (s.started_by = auth.uid() or auth.uid() is null); -- service role allowed
+
+  if v_vehicle_id is null then
+    raise exception 'Invalid or ended session';
+  end if;
+
+  -- Update status if a live row exists; do not insert a dummy row without lat/lng
+  update public.vehicle_live
+     set status = p_status,
+         ts     = now()
+   where vehicle_id = v_vehicle_id;
+end $$;
+
+grant execute on function public.set_vehicle_status(uuid, text) to authenticated;
+
+-- Recreate the view to allow column set changes (add status)
+drop view if exists public.vehicle_with_live;
+create view public.vehicle_with_live as
 select
   v.id,
   v.company_id,
@@ -323,6 +365,7 @@ select
   l.speed,
   l.heading,
   l.accuracy,
+  l.status,
   l.ts as live_ts
 from public.vehicles v
 left join public.vehicle_live l on l.vehicle_id = v.id;

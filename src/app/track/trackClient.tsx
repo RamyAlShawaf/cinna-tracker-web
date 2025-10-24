@@ -20,6 +20,7 @@ interface LivePoint {
 	speed?: number | null;
 	heading?: number | null;
 	accuracy?: number | null;
+  status?: 'online' | 'paused';
 	ts?: string;
 }
 
@@ -83,7 +84,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		async function prime() {
 			if (!code) return;
 			setStatus('Loading last position…');
-			const r = await fetch(`/api/vehicle/${encodeURIComponent(code)}/last`);
+      const r = await fetch(`/api/vehicle/${encodeURIComponent(code)}/last`);
 			if (r.ok) {
 				const data = await r.json();
 				if (mounted) setPoint(data);
@@ -109,7 +110,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		const channel = supabase
 			.channel(`live:${vehicleId}`)
 			.on(
-				'postgres_changes',
+        'postgres_changes',
 				{ event: '*', schema: 'public', table: 'vehicle_live', filter: `vehicle_id=eq.${vehicleId}` },
 				(payload: any) => {
 					const row = (payload.new || payload.record) as any;
@@ -120,6 +121,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 						speed: row.speed,
 						heading: row.heading,
 						accuracy: row.accuracy,
+            status: row.status,
 						ts: row.ts,
 					});
 				}
@@ -153,7 +155,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		</div>
 	);
 
-	const infoOverlay = point ? (
+  const infoOverlay = point ? (
 		<div className="absolute left-0 right-0 bottom-0 p-0 sm:p-4 z-[401]" aria-live="polite">
 			<div className="w-full sm:max-w-xl sm:mx-auto card card-contrast px-4 py-6 sm:p-4 flex items-center justify-between gap-4 rounded-b-none sm:rounded-t-xl sm:rounded-b-xl track-info-card">
 				<div className="min-w-0">
@@ -165,6 +167,14 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 						<span className="text-muted">Last:</span>{' '}
 						{point.ts ? new Date(point.ts).toLocaleTimeString() : '—'}
 					</div>
+          <div>
+            <span className="text-muted">Status:</span>{' '}
+            {point.status === 'paused' ? (
+              <span className="text-yellow-600">Paused</span>
+            ) : (
+              <span className="text-emerald-600">Online</span>
+            )}
+          </div>
 				</div>
 			</div>
 		</div>
