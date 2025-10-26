@@ -28,12 +28,19 @@ interface LivePoint {
 
 export default function TrackClient({ code, showInput = true }: TrackClientProps) {
 	const [point, setPoint] = useState<LivePoint | null>(null);
+	// Interpolated display position for smooth marker animation
+	const [display, setDisplay] = useState<{ lat: number; lng: number } | null>(null);
 	const [vehicleId, setVehicleId] = useState<string | null>(null);
 	const [vehicleLabel, setVehicleLabel] = useState<string | null>(null);
 	const [status, setStatus] = useState<string>('');
 	const [leaflet, setLeaflet] = useState<any>(null);
 	const [isDark, setIsDark] = useState(true);
 	const mapRef = useRef<any>(null);
+	const animRafRef = useRef<number | null>(null);
+	const animFromRef = useRef<{ lat: number; lng: number } | null>(null);
+	const animToRef = useRef<{ lat: number; lng: number } | null>(null);
+	const animStartRef = useRef<number>(0);
+	const animDurationMsRef = useRef<number>(900);
 	const maptilerKey = process.env.NEXT_PUBLIC_MAPTILER_KEY;
 	const mapStyleDark = process.env.NEXT_PUBLIC_MAP_STYLE_DARK || process.env.NEXT_PUBLIC_MAP_STYLE || 'basic-v2-dark';
 	const mapStyleLight = process.env.NEXT_PUBLIC_MAP_STYLE_LIGHT || 'basic-v2';
@@ -160,12 +167,60 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	}, [vehicleId, supabase]);
 
 	useEffect(() => {
-		if (mapRef.current && point) {
-			if (typeof point.lat === 'number' && typeof point.lng === 'number') {
-				mapRef.current.setView([point.lat, point.lng], 15);
+		// Smoothly move the map center when a new target point arrives
+		if (!mapRef.current || !point) return;
+		if (typeof point.lat !== 'number' || typeof point.lng !== 'number') return;
+		try {
+			const z = mapRef.current.getZoom ? mapRef.current.getZoom() : 15;
+			if (mapRef.current.flyTo) {
+				mapRef.current.flyTo([point.lat, point.lng], z, { duration: 0.9 });
+			} else if (mapRef.current.panTo) {
+				mapRef.current.panTo([point.lat, point.lng], { animate: true });
 			}
-		}
+		} catch {}
 	}, [point]);
+
+	// Animate marker position between pings
+	useEffect(() => {
+		if (!point || typeof point.lat !== 'number' || typeof point.lng !== 'number') return;
+		const target = { lat: point.lat, lng: point.lng };
+		// First point: snap and prime state
+		if (!display) {
+			setDisplay(target);
+			return;
+		}
+		// Start a new animation from current displayed position to target
+		animFromRef.current = display;
+		animToRef.current = target;
+		animStartRef.current = performance.now();
+		const duration = animDurationMsRef.current;
+		const easeInOutCubic = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+		if (animRafRef.current) cancelAnimationFrame(animRafRef.current);
+		const tick = () => {
+			const now = performance.now();
+			let t = (now - animStartRef.current) / duration;
+			if (t >= 1) {
+				setDisplay(animToRef.current!);
+				animRafRef.current = null;
+				return;
+			}
+			t = Math.max(0, Math.min(1, t));
+			t = easeInOutCubic(t);
+			const from = animFromRef.current!;
+			const to = animToRef.current!;
+			setDisplay({
+				lat: from.lat + (to.lat - from.lat) * t,
+				lng: from.lng + (to.lng - from.lng) * t,
+			});
+			animRafRef.current = requestAnimationFrame(tick);
+		};
+		animRafRef.current = requestAnimationFrame(tick);
+		return () => {
+			if (animRafRef.current) cancelAnimationFrame(animRafRef.current);
+			animRafRef.current = null;
+		};
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [point?.lat, point?.lng]);
 
 	const waiting = (
 		<div className="absolute inset-0" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -255,7 +310,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 							pathOptions={{ color: '#3b82f6', weight: 4, opacity: 0.8 }}
 						/>
 					)}
-					<Marker position={[point!.lat, point!.lng] as [number, number]} icon={pulseIcon as any}>
+					<Marker position={[(display?.lat ?? point!.lat), (display?.lng ?? point!.lng)] as [number, number]} icon={pulseIcon as any}>
 						<Popup>
 							<div className="text-sm">
 								<div>Lat: {Number(point!.lat).toFixed(5)}, Lng: {Number(point!.lng).toFixed(5)}</div>
