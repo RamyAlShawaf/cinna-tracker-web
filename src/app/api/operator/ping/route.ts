@@ -10,6 +10,7 @@ const bodySchema = z.object({
   heading: z.number().optional(),
   accuracy: z.number().optional(),
   ts: z.string().optional(),
+  route: z.any().optional(),
 });
 
 function getEnv(name: string): string {
@@ -38,21 +39,36 @@ export async function POST(req: NextRequest) {
     const claims = await verifyToken(token);
 
     const json = await req.json();
-    const { lat, lng, speed, heading, accuracy } = bodySchema.parse(json);
+    const { lat, lng, speed, heading, accuracy, route } = bodySchema.parse(json);
 
     const supabase = createClient(
       getEnv('NEXT_PUBLIC_SUPABASE_URL'),
       getEnv('SUPABASE_SERVICE_ROLE_KEY')
     );
 
-    const { error } = await supabase.rpc('publish_vehicle_live', {
+    let { error } = await supabase.rpc('publish_vehicle_live', {
       p_session_id: claims.session_id,
       p_lat: lat,
       p_lng: lng,
       p_speed: speed ?? null,
       p_heading: heading ?? null,
       p_accuracy: accuracy ?? null,
+      p_route: route ?? null,
     });
+
+    // Backward-compat: if the DB hasn't been migrated to accept p_route yet,
+    // retry without the parameter (older function signature)
+    if (error && /p_route|function publish_vehicle_live|No function matches/i.test(error.message || '')) {
+      const retry = await supabase.rpc('publish_vehicle_live', {
+        p_session_id: claims.session_id,
+        p_lat: lat,
+        p_lng: lng,
+        p_speed: speed ?? null,
+        p_heading: heading ?? null,
+        p_accuracy: accuracy ?? null,
+      } as any);
+      error = retry.error as any;
+    }
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 400 });

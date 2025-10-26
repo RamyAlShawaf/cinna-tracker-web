@@ -52,12 +52,15 @@ create table if not exists public.vehicle_live (
   heading    double precision,
   accuracy   double precision,
   status     text not null default 'online' check (status in ('online','paused')),
+  route      jsonb,
   ts         timestamptz not null default now()
 );
 
 -- Ensure status column exists for existing databases created before this change
 alter table if exists public.vehicle_live
   add column if not exists status text not null default 'online' check (status in ('online','paused'));
+alter table if exists public.vehicle_live
+  add column if not exists route jsonb;
 
 -- Optional: auto-refresh ts on updates
 create or replace function public._touch_vehicle_live_ts()
@@ -260,13 +263,16 @@ end $$;
 grant execute on function public.end_vehicle_session(uuid) to authenticated;
 
 -- Publish a live sample for an active session
+-- Ensure old overload is removed to avoid PostgREST 300 (multiple choices)
+drop function if exists public.publish_vehicle_live(uuid, double precision, double precision, double precision, double precision, double precision);
 create or replace function public.publish_vehicle_live(
   p_session_id uuid,
   p_lat        double precision,
   p_lng        double precision,
   p_speed      double precision default null,
   p_heading    double precision default null,
-  p_accuracy   double precision default null
+  p_accuracy   double precision default null,
+  p_route      jsonb default null
 ) returns void
 language plpgsql
 security definer
@@ -299,19 +305,20 @@ begin
   end if;
 
   -- Upsert latest position
-  insert into public.vehicle_live (vehicle_id, lat, lng, speed, heading, accuracy, status, ts)
-  values (v_vehicle_id, p_lat, p_lng, p_speed, p_heading, p_accuracy, 'online', now())
+  insert into public.vehicle_live (vehicle_id, lat, lng, speed, heading, accuracy, status, route, ts)
+  values (v_vehicle_id, p_lat, p_lng, p_speed, p_heading, p_accuracy, 'online', p_route, now())
   on conflict (vehicle_id) do update
     set lat      = excluded.lat,
         lng      = excluded.lng,
         speed    = excluded.speed,
         heading  = excluded.heading,
         accuracy = excluded.accuracy,
+        route    = excluded.route,
         status   = 'online',
         ts       = excluded.ts;
 end $$;
 
-grant execute on function public.publish_vehicle_live(uuid, double precision, double precision, double precision, double precision, double precision)
+grant execute on function public.publish_vehicle_live(uuid, double precision, double precision, double precision, double precision, double precision, jsonb)
   to authenticated;
 
 -- Allow operators to explicitly set status (e.g., pause/resume) without sending a location

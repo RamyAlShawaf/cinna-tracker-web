@@ -5,6 +5,7 @@ const MapContainer = dynamic(() => import('react-leaflet').then(m => m.MapContai
 const TileLayer = dynamic(() => import('react-leaflet').then(m => m.TileLayer), { ssr: false }) as any;
 const Marker = dynamic(() => import('react-leaflet').then(m => m.Marker), { ssr: false }) as any;
 const Popup = dynamic(() => import('react-leaflet').then(m => m.Popup), { ssr: false }) as any;
+const Polyline = dynamic(() => import('react-leaflet').then(m => m.Polyline), { ssr: false }) as any;
 import 'leaflet/dist/leaflet.css';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
@@ -22,6 +23,7 @@ interface LivePoint {
 	accuracy?: number | null;
   status?: 'online' | 'paused';
 	ts?: string;
+  route?: { coordinates?: Array<{ lat: number; lng: number }> } | null;
 }
 
 export default function TrackClient({ code, showInput = true }: TrackClientProps) {
@@ -135,6 +137,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 						accuracy: row.accuracy,
 						status: row.status,
 						ts: row.ts,
+						route: row.route || null,
 					});
 					setStatus('');
 				}
@@ -246,6 +249,12 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 						tileSize={usingMapTiler ? 512 : undefined as any}
 						zoomOffset={usingMapTiler ? -1 : undefined as any}
 					/>
+					{point?.route?.coordinates && point.route.coordinates.length > 1 && (
+						<Polyline
+							positions={point.route.coordinates.map(c => [c.lat, c.lng] as [number, number])}
+							pathOptions={{ color: '#3b82f6', weight: 4, opacity: 0.8 }}
+						/>
+					)}
 					<Marker position={[point!.lat, point!.lng] as [number, number]} icon={pulseIcon as any}>
 						<Popup>
 							<div className="text-sm">
