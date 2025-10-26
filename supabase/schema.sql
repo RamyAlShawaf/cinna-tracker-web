@@ -351,24 +351,153 @@ end $$;
 
 grant execute on function public.set_vehicle_status(uuid, text) to authenticated;
 
--- Recreate the view to allow column set changes (add status)
-drop view if exists public.vehicle_with_live;
-create view public.vehicle_with_live as
-select
-  v.id,
-  v.company_id,
-  v.label,
-  v.public_code,
-  v.created_at,
-  l.lat,
-  l.lng,
-  l.speed,
-  l.heading,
-  l.accuracy,
-  l.status,
-  l.ts as live_ts
-from public.vehicles v
-left join public.vehicle_live l on l.vehicle_id = v.id;
+-- ---------------------------------------------------------
+-- trips and trip_stops (route scaffolding for end-user pathing)
+-- ---------------------------------------------------------
 
--- Public can still select from the raw tables due to policies above.
--- You can add a policy for the view if you want to expose it directly.
+-- trips (per company)
+create table if not exists public.trips (
+  id          uuid primary key default gen_random_uuid(),
+  company_id  uuid not null references public.companies(id) on delete cascade,
+  name        text not null,
+  code        text unique,
+  path_polyline text,
+  created_at  timestamptz not null default now()
+);
+
+create index if not exists idx_trips_company_id on public.trips(company_id);
+
+-- ordered stops within a trip
+create table if not exists public.trip_stops (
+  id            uuid primary key default gen_random_uuid(),
+  trip_id       uuid not null references public.trips(id) on delete cascade,
+  name          text not null,
+  lat           double precision not null check (lat between -90 and 90),
+  lng           double precision not null check (lng between -180 and 180),
+  sequence      int not null check (sequence >= 1),
+  dwell_seconds int,
+  created_at    timestamptz not null default now()
+);
+
+create unique index if not exists ux_trip_stops_trip_sequence
+  on public.trip_stops(trip_id, sequence);
+
+-- attach a trip to an operator's active session
+alter table if exists public.vehicle_sessions
+  add column if not exists trip_id uuid references public.trips(id);
+
+create index if not exists idx_vehicle_sessions_trip_id on public.vehicle_sessions(trip_id);
+
+-- RLS for trips and trip_stops
+alter table public.trips enable row level security;
+alter table public.trip_stops enable row level security;
+
+do $$ begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='trips' and policyname='public read trips'
+  ) then
+    create policy "public read trips"
+      on public.trips
+      for select
+      using (true);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='trip_stops' and policyname='public read trip_stops'
+  ) then
+    create policy "public read trip_stops"
+      on public.trip_stops
+      for select
+      using (true);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='trips' and policyname='deny direct writes'
+  ) then
+    create policy "deny direct writes"
+      on public.trips
+      for all to public
+      using (false)
+      with check (false);
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+    where schemaname='public' and tablename='trip_stops' and policyname='deny direct writes'
+  ) then
+    create policy "deny direct writes"
+      on public.trip_stops
+      for all to public
+      using (false)
+      with check (false);
+  end if;
+end $$;
+
+ 
+
+-- RPC: assign a trip to an active session (starter or service role)
+create or replace function public.assign_trip_to_session(
+  p_session_id uuid,
+  p_trip_id    uuid
+) returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_vehicle_company uuid;
+  v_trip_company    uuid;
+  v_updated int;
+begin
+  select c.id
+    into v_vehicle_company
+  from public.vehicle_sessions s
+  join public.vehicles v on v.id = s.vehicle_id
+  join public.companies c on c.id = v.company_id
+  where s.id = p_session_id
+    and s.ended_at is null
+    and (s.started_by = auth.uid() or auth.uid() is null);
+
+  select company_id into v_trip_company
+  from public.trips
+  where id = p_trip_id;
+
+  if v_vehicle_company is null or v_trip_company is null or v_vehicle_company <> v_trip_company then
+    raise exception 'Trip and session vehicle must belong to same company';
+  end if;
+
+  update public.vehicle_sessions
+     set trip_id = p_trip_id
+   where id = p_session_id
+   returning 1 into v_updated;
+
+  return coalesce(v_updated, 0) = 1;
+end $$;
+
+grant execute on function public.assign_trip_to_session(uuid, uuid) to authenticated;
+
+-- RPC: clear trip from a session
+create or replace function public.clear_trip_from_session(
+  p_session_id uuid
+) returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_updated int;
+begin
+  update public.vehicle_sessions s
+     set trip_id = null
+   where s.id = p_session_id
+     and s.ended_at is null
+     and (s.started_by = auth.uid() or auth.uid() is null)
+   returning 1 into v_updated;
+
+  return coalesce(v_updated, 0) = 1;
+end $$;
+
+grant execute on function public.clear_trip_from_session(uuid) to authenticated;

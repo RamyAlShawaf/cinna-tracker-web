@@ -29,6 +29,33 @@ export async function addVehicle(formData: FormData) {
   return { ok: true };
 }
 
+export async function addTrip(formData: FormData) {
+  const session = await getSession();
+  if (!session) return { error: 'Unauthorized' };
+  const name = String(formData.get('name') || '').trim();
+  const code = (String(formData.get('code') || '').trim() || null) as string | null;
+  const pathPolyline = (String(formData.get('path_polyline') || '').trim() || null) as string | null;
+  if (!name) return { error: 'Name required' };
+
+  let companyId: string | null = null;
+  if (session.scope === 'admin') {
+    companyId = String(formData.get('company_id') || '').trim() || null;
+  } else {
+    companyId = session.company_id || null;
+  }
+  if (!companyId) return { error: 'company_id required' };
+
+  const supabase = supabaseServiceClient();
+  const { error } = await supabase.from('trips').insert({
+    name,
+    code,
+    path_polyline: pathPolyline,
+    company_id: companyId,
+  });
+  if (error) return { error: error.message };
+  return { ok: true };
+}
+
 export async function deleteVehicle(id: string) {
   const session = await getSession();
   if (!session) return { error: 'Unauthorized' };

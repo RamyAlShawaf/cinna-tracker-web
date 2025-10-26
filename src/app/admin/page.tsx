@@ -3,6 +3,8 @@ import { addVehicle, deleteVehicle, addCompany, deleteCompany, addOwnerByEmail, 
 import { getSession } from '@/lib/auth';
 import { redirect } from 'next/navigation';
 import QRCode from 'qrcode';
+import { addTrip } from './actions';
+import { TripsManager } from './TripsManager';
 
 async function getVehicles(companyId?: string) {
   const supabase = supabaseServiceClient();
@@ -81,6 +83,11 @@ export default async function AdminPage() {
   const isAdmin = session?.scope === 'admin';
   const companies = isAdmin ? await getCompanies() : [];
   const vehicles = await getVehicles(isAdmin ? undefined : session?.company_id);
+  const supabase = supabaseServiceClient();
+  const { data: trips } = await supabase
+    .from('trips')
+    .select('id, name, code, company_id, created_at')
+    .order('created_at', { ascending: false });
 
   return (
     <div className="space-y-8">
@@ -264,6 +271,35 @@ export default async function AdminPage() {
             </tbody>
           </table>
         </div>
+      </section>
+
+      <section className="card p-5 space-y-4">
+        <h2 className="text-lg font-semibold">Trips</h2>
+        <form action={async (formData: FormData) => { 'use server'; await addTrip(formData); }} className="grid grid-cols-1 sm:grid-cols-4 gap-4 items-end">
+          {isAdmin && (
+            <div>
+              <label className="block text-sm mb-1 text-muted">Company</label>
+              <select name="company_id" className="input">
+                {companies.map((c: any) => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          <div>
+            <label className="block text-sm mb-1 text-muted">Name</label>
+            <input name="name" className="input" placeholder="e.g., Route A (Downtown)" />
+          </div>
+          <div>
+            <label className="block text-sm mb-1 text-muted">Code (optional)</label>
+            <input name="code" className="input" placeholder="e.g., A-DWTN" />
+          </div>
+          <div className="sm:col-span-4">
+            <button className="btn btn-primary">Create trip</button>
+          </div>
+        </form>
+
+        <TripsManager trips={(trips || []) as any} />
       </section>
     </div>
   );
