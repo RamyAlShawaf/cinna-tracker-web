@@ -26,7 +26,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ code: stri
 
     const { data: live, error: lErr } = await supabase
       .from('vehicle_live')
-      .select('lat, lng, speed, heading, accuracy, status, ts')
+      .select('lat, lng, speed, heading, accuracy, status, ts, route')
       .eq('vehicle_id', vehicle.id)
       .single();
 

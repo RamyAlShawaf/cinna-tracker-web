@@ -86,10 +86,10 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		async function prime() {
 			if (!code) return;
 			setStatus('Loading last position…');
-			const r = await fetch(`/api/vehicle/${encodeURIComponent(code)}/last`);
+            const r = await fetch(`/api/vehicle/${encodeURIComponent(code)}/last`);
 			if (r.ok) {
 				const data = await r.json();
-				if (mounted) setPoint(data);
+              if (mounted) setPoint(data);
 			} else {
 				// No live row -> offline
 				if (mounted) {
@@ -102,7 +102,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 				.select('id,label')
 				.eq('public_code', code)
 				.single();
-			if (v?.id && mounted) {
+            if (v?.id && mounted) {
 				setVehicleId(v.id);
 				setVehicleLabel((v as any).label || null);
 			}
