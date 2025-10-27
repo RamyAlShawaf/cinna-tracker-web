@@ -46,16 +46,15 @@ export async function POST(req: NextRequest) {
       getEnv('SUPABASE_SERVICE_ROLE_KEY')
     );
 
-    const args: any = {
+    let { error } = await supabase.rpc('publish_vehicle_live', {
       p_session_id: claims.session_id,
       p_lat: lat,
       p_lng: lng,
       p_speed: speed ?? null,
       p_heading: heading ?? null,
       p_accuracy: accuracy ?? null,
-    };
-    if (route !== undefined && route !== null) args.p_route = route;
-    let { error } = await supabase.rpc('publish_vehicle_live', args);
+      p_route: route ?? null,
+    });
 
     // Backward-compat: if the DB hasn't been migrated to accept p_route yet,
     // retry without the parameter (older function signature)
