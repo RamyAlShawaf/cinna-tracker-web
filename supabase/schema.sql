@@ -313,7 +313,7 @@ begin
         speed    = excluded.speed,
         heading  = excluded.heading,
         accuracy = excluded.accuracy,
-        route    = excluded.route,
+        route    = coalesce(excluded.route, public.vehicle_live.route),
         status   = 'online',
         ts       = excluded.ts;
 end $$;
