@@ -40,6 +40,10 @@ create unique index if not exists ux_vehicle_sessions_one_active
 create index if not exists idx_vehicle_sessions_vehicle_started_at
   on public.vehicle_sessions(vehicle_id, started_at desc);
 
+-- Ensure destination_stop_id exists for storing selected target stop
+alter table if exists public.vehicle_sessions
+  add column if not exists destination_stop_id uuid references public.trip_stops(id);
+
 -- ---------------------------------------------------------
 -- vehicle_live
 --   One live row per vehicle (latest sample)
