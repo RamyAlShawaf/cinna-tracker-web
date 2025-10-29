@@ -362,6 +362,38 @@ end $$;
 
 grant execute on function public.set_vehicle_status(uuid, text) to authenticated;
 
+-- Combined pause: set status='paused' and clear route in one atomic call
+create or replace function public.set_vehicle_paused(
+  p_session_id uuid
+) returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_vehicle_id uuid;
+begin
+  -- Verify session belongs to the caller and is active
+  select s.vehicle_id
+    into v_vehicle_id
+  from public.vehicle_sessions s
+  where s.id = p_session_id
+    and s.ended_at is null
+    and (s.started_by = auth.uid() or auth.uid() is null); -- service role allowed
+
+  if v_vehicle_id is null then
+    raise exception 'Invalid or ended session';
+  end if;
+
+  update public.vehicle_live
+     set status = 'paused',
+         route  = null,
+         ts     = now()
+   where vehicle_id = v_vehicle_id;
+end $$;
+
+grant execute on function public.set_vehicle_paused(uuid) to authenticated;
+
 -- ---------------------------------------------------------
 -- trips and trip_stops (route scaffolding for end-user pathing)
 -- ---------------------------------------------------------
