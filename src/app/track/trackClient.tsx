@@ -35,12 +35,15 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const [status, setStatus] = useState<string>('');
 	const [leaflet, setLeaflet] = useState<any>(null);
 	const [isDark, setIsDark] = useState(true);
+	const [userPos, setUserPos] = useState<{ lat: number; lng: number } | null>(null);
 	const mapRef = useRef<any>(null);
 	const animRafRef = useRef<number | null>(null);
 	const animFromRef = useRef<{ lat: number; lng: number } | null>(null);
 	const animToRef = useRef<{ lat: number; lng: number } | null>(null);
 	const animStartRef = useRef<number>(0);
 	const animDurationMsRef = useRef<number>(900);
+	const centeredOnUserRef = useRef<boolean>(false);
+	const geoWatchIdRef = useRef<number | null>(null);
 	const maptilerKey = process.env.NEXT_PUBLIC_MAPTILER_KEY;
 	const mapStyleDark = process.env.NEXT_PUBLIC_MAP_STYLE_DARK || process.env.NEXT_PUBLIC_MAP_STYLE || 'basic-v2-dark';
 	const mapStyleLight = process.env.NEXT_PUBLIC_MAP_STYLE_LIGHT || 'basic-v2';
@@ -87,6 +90,51 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 			popupAnchor: [0, -12],
 		});
 	}, [leaflet]);
+
+	const userIcon = useMemo(() => {
+		if (!leaflet) return null;
+		return leaflet.divIcon({
+			className: 'user-icon',
+			html: '<div class="user-dot"></div>',
+			iconSize: [22, 22],
+			iconAnchor: [11, 11],
+			popupAnchor: [0, -10],
+		});
+	}, [leaflet]);
+
+	const destIcon = useMemo(() => {
+		if (!leaflet) return null;
+		return leaflet.divIcon({
+			className: 'dest-icon',
+			html: '<div class="dest-square"></div>',
+			iconSize: [16, 16],
+			iconAnchor: [8, 8],
+			popupAnchor: [0, -10],
+		});
+	}, [leaflet]);
+
+	// Acquire user location (initial + watch) and center map to user once on load
+	useEffect(() => {
+		if (typeof window === 'undefined' || !('geolocation' in navigator)) return;
+		const opts: PositionOptions = { enableHighAccuracy: true, timeout: 8000, maximumAge: 10_000 };
+		navigator.geolocation.getCurrentPosition(
+			(pos) => {
+				setUserPos({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+			},
+			() => {
+				// swallow; fallback remains vehicle position
+			},
+			opts
+		);
+		geoWatchIdRef.current = navigator.geolocation.watchPosition(
+			(pos) => setUserPos({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+			() => {},
+			opts
+		);
+		return () => {
+			if (geoWatchIdRef.current != null) navigator.geolocation.clearWatch(geoWatchIdRef.current);
+		};
+	}, []);
 
 	useEffect(() => {
 		let mounted = true;
@@ -179,6 +227,17 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 			}
 		} catch {}
 	}, [point]);
+
+	// Center to user's location once on load if permission granted
+	useEffect(() => {
+		if (!mapRef.current || !userPos || centeredOnUserRef.current) return;
+		try {
+			const z = mapRef.current.getZoom ? mapRef.current.getZoom() : 15;
+			if (mapRef.current.flyTo) mapRef.current.flyTo([userPos.lat, userPos.lng], z, { duration: 0.6 });
+			else if (mapRef.current.panTo) mapRef.current.panTo([userPos.lat, userPos.lng], { animate: true });
+			centeredOnUserRef.current = true;
+		} catch {}
+	}, [userPos]);
 
 	// Animate marker position between pings
 	useEffect(() => {
@@ -283,20 +342,21 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 					<div className="text-sm text-muted">{status}</div>
 				</div>
 			)}
-			{!hasCoords || !pulseIcon ? (
-				status === 'Offline' ? offline : waiting
-			) : (
-				<MapContainer
-					center={[point!.lat, point!.lng] as [number, number]}
-					zoom={15}
-					zoomControl={false}
-					attributionControl={false}
-					whenCreated={(m: any) => {
-						mapRef.current = m;
-						m.setView([point!.lat, point!.lng], 15);
-					}}
-					style={{ position: 'absolute', inset: 0 }}
-				>
+			{(() => {
+				const center = userPos || (hasCoords ? { lat: point!.lat, lng: point!.lng } : null);
+				if (!center) return (status === 'Offline' ? offline : waiting);
+				return (
+					<MapContainer
+						center={[center.lat, center.lng] as [number, number]}
+						zoom={15}
+						zoomControl={false}
+						attributionControl={false}
+						whenCreated={(m: any) => {
+							mapRef.current = m;
+							m.setView([center.lat, center.lng], 15);
+						}}
+						style={{ position: 'absolute', inset: 0 }}
+					>
 					<TileLayer
 						attribution={attribution}
 						url={tileUrl}
@@ -304,13 +364,30 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 						tileSize={usingMapTiler ? 512 : undefined as any}
 						zoomOffset={usingMapTiler ? -1 : undefined as any}
 					/>
-					{point?.route?.coordinates && point.route.coordinates.length > 1 && (
+					{userPos && (
+						<Marker position={[userPos.lat, userPos.lng] as [number, number]} icon={(userIcon || undefined) as any}>
+							<Popup>
+								<div className="text-sm">You are here</div>
+							</Popup>
+						</Marker>
+					)}
+					{point?.status !== 'paused' && point?.route?.coordinates && point.route.coordinates.length > 1 && (
 						<Polyline
 							positions={point.route.coordinates.map(c => [c.lat, c.lng] as [number, number])}
-							pathOptions={{ color: '#3b82f6', weight: 4, opacity: 0.8 }}
+							pathOptions={{ color: (isDark ? '#ffffff' : '#000000'), weight: 4, opacity: 0.9 }}
 						/>
 					)}
-					<Marker position={[(display?.lat ?? point!.lat), (display?.lng ?? point!.lng)] as [number, number]} icon={pulseIcon as any}>
+					{point?.status !== 'paused' && point?.route?.coordinates && point.route.coordinates.length > 0 && (
+						<Marker
+							position={[
+								point.route.coordinates[point.route.coordinates.length - 1].lat,
+								point.route.coordinates[point.route.coordinates.length - 1].lng,
+							] as [number, number]}
+							icon={(destIcon || undefined) as any}
+						/>
+					)}
+					{hasCoords && (
+						<Marker position={[(display?.lat ?? point!.lat), (display?.lng ?? point!.lng)] as [number, number]} icon={(pulseIcon || undefined) as any}>
 						<Popup>
 							<div className="text-sm">
 								<div>Lat: {Number(point!.lat).toFixed(5)}, Lng: {Number(point!.lng).toFixed(5)}</div>
@@ -318,14 +395,20 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 								{point!.ts && <div>Last seen: {new Date(point!.ts!).toLocaleTimeString()}</div>}
 							</div>
 						</Popup>
-					</Marker>
-				</MapContainer>
-			)}
+						</Marker>
+					)}
+					</MapContainer>
+				);
+			})()}
 			{infoOverlay}
 			<style jsx global>{`
 				.leaflet-div-icon.pulse-icon { background: transparent; border: none; }
 				.pulse-icon .pulse-dot { width: 18px; height: 18px; background: #14b8a6; border: 2px solid #ffffff; border-radius: 9999px; box-shadow: 0 0 0 rgba(20, 184, 166, 0.5); position: relative; }
 				.pulse-icon .pulse-dot::after { content: ''; position: absolute; left: 50%; top: 50%; width: 100%; height: 100%; border-radius: 9999px; transform: translate(-50%, -50%) scale(1); background: rgba(20, 184, 166, 0.35); animation: pulse-ring 1.8s ease-out infinite; }
+				.leaflet-div-icon.user-icon { background: transparent; border: none; }
+				.user-icon .user-dot { width: 14px; height: 14px; background: #3b82f6; border: 2px solid #ffffff; border-radius: 9999px; box-shadow: 0 0 0 rgba(59, 130, 246, 0.45); }
+				.leaflet-div-icon.dest-icon { background: transparent; border: none; }
+				.dest-icon .dest-square { width: 16px; height: 16px; background: ${isDark ? '#000000' : '#ffffff'}; border: 3px solid ${isDark ? '#ffffff' : '#000000'}; border-radius: 0; box-shadow: 0 2px 6px rgba(0,0,0,0.15); }
 				@keyframes pulse-ring { 0% { transform: translate(-50%, -50%) scale(1); opacity: 0.75; } 100% { transform: translate(-50%, -50%) scale(2.8); opacity: 0; } }
 				/* Hide Leaflet attribution overlay if it renders */
 				.leaflet-control-attribution { display: none !important; }
