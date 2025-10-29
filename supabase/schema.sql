@@ -20,6 +20,10 @@ create table if not exists public.vehicles (
 
 create index if not exists idx_vehicles_public_code on public.vehicles(public_code);
 
+-- Photo URL for displaying a vehicle picture
+alter table if exists public.vehicles
+  add column if not exists photo_url text;
+
 -- ---------------------------------------------------------
 -- vehicle_sessions
 --   One active session per vehicle (operator scans QR and "go")

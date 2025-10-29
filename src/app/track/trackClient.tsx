@@ -32,6 +32,8 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const [display, setDisplay] = useState<{ lat: number; lng: number } | null>(null);
 	const [vehicleId, setVehicleId] = useState<string | null>(null);
 	const [vehicleLabel, setVehicleLabel] = useState<string | null>(null);
+	const [vehiclePhotoUrl, setVehiclePhotoUrl] = useState<string | null>(null);
+	const [isPreviewOpen, setIsPreviewOpen] = useState(false);
 	const [status, setStatus] = useState<string>('');
 	const [leaflet, setLeaflet] = useState<any>(null);
 	const [isDark, setIsDark] = useState(true);
@@ -154,12 +156,13 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 			}
 			const { data: v } = await supabase
 				.from('vehicles')
-				.select('id,label')
+				.select('id,label,photo_url')
 				.eq('public_code', code)
 				.single();
-            if (v?.id && mounted) {
+				if (v?.id && mounted) {
 				setVehicleId(v.id);
 				setVehicleLabel((v as any).label || null);
+				setVehiclePhotoUrl((v as any).photo_url || null);
 			}
 			if (mounted && status === 'Loading last position…') setStatus('');
 		}
@@ -299,9 +302,20 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const infoOverlay = (
 		<div className="absolute left-0 right-0 bottom-0 p-0 sm:p-4 z-[401]" aria-live="polite">
 			<div className="w-full sm:max-w-xl sm:mx-auto card card-contrast px-4 py-6 sm:p-4 flex items-center justify-between gap-4 rounded-b-none sm:rounded-t-xl sm:rounded-b-xl track-info-card">
-				<div className="min-w-0">
-					<div className="text-sm text-muted">Vehicle</div>
-					<div className="font-medium truncate">{vehicleLabel || code}</div>
+				<div className="min-w-0 flex items-center gap-3">
+					{vehiclePhotoUrl && (
+						/* eslint-disable @next/next/no-img-element */
+						<img
+							src={vehiclePhotoUrl}
+							alt="Vehicle"
+							className="w-10 h-10 rounded object-cover border border-[var(--border)] cursor-pointer"
+							onClick={() => setIsPreviewOpen(true)}
+						/>
+					)}
+					<div>
+						<div className="text-sm text-muted">Vehicle</div>
+						<div className="font-medium truncate">{vehicleLabel || code}</div>
+					</div>
 				</div>
 				<div className="flex flex-wrap sm:flex-nowrap items-center gap-x-4 gap-y-1 sm:gap-6 text-sm">
 					<div>
@@ -401,6 +415,30 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 				);
 			})()}
 			{infoOverlay}
+			{vehiclePhotoUrl && isPreviewOpen && (
+				<div
+					className="fixed inset-0 z-[1000] bg-black/75 flex items-center justify-center p-4 pt-14 md:pt-20"
+					role="dialog"
+					aria-modal="true"
+					onClick={() => setIsPreviewOpen(false)}
+				>
+					<div className="relative" onClick={(e) => e.stopPropagation()}>
+						{/* eslint-disable @next/next/no-img-element */}
+						<img
+							src={vehiclePhotoUrl}
+							alt="Vehicle full"
+							className="max-w-[88vw] max-h-[78vh] rounded shadow-xl"
+						/>
+						<button
+							onClick={() => setIsPreviewOpen(false)}
+							className="absolute -top-3 -right-3 bg-white text-black rounded-full w-8 h-8 flex items-center justify-center shadow"
+							aria-label="Close preview"
+						>
+							×
+						</button>
+					</div>
+				</div>
+			)}
 			<style jsx global>{`
 				.leaflet-div-icon.pulse-icon { background: transparent; border: none; }
 				.pulse-icon .pulse-dot { width: 18px; height: 18px; background: #14b8a6; border: 2px solid #ffffff; border-radius: 9999px; box-shadow: 0 0 0 rgba(20, 184, 166, 0.5); position: relative; }
