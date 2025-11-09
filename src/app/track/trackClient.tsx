@@ -93,6 +93,17 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		});
 	}, [leaflet]);
 
+	const pulseIconPaused = useMemo(() => {
+		if (!leaflet) return null;
+		return leaflet.divIcon({
+			className: 'pulse-icon paused',
+			html: '<div class="pulse-dot"></div>',
+			iconSize: [28, 28],
+			iconAnchor: [14, 14],
+			popupAnchor: [0, -12],
+		});
+	}, [leaflet]);
+
 	const userIcon = useMemo(() => {
 		if (!leaflet) return null;
 		return leaflet.divIcon({
@@ -401,7 +412,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 						/>
 					)}
 					{hasCoords && (
-						<Marker position={[(display?.lat ?? point!.lat), (display?.lng ?? point!.lng)] as [number, number]} icon={(pulseIcon || undefined) as any}>
+						<Marker position={[(display?.lat ?? point!.lat), (display?.lng ?? point!.lng)] as [number, number]} icon={((point?.status === 'paused' ? pulseIconPaused : pulseIcon) || undefined) as any}>
 						<Popup>
 							<div className="text-sm">
 								<div>Lat: {Number(point!.lat).toFixed(5)}, Lng: {Number(point!.lng).toFixed(5)}</div>
@@ -443,6 +454,8 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 				.leaflet-div-icon.pulse-icon { background: transparent; border: none; }
 				.pulse-icon .pulse-dot { width: 18px; height: 18px; background: #14b8a6; border: 2px solid #ffffff; border-radius: 9999px; box-shadow: 0 0 0 rgba(20, 184, 166, 0.5); position: relative; }
 				.pulse-icon .pulse-dot::after { content: ''; position: absolute; left: 50%; top: 50%; width: 100%; height: 100%; border-radius: 9999px; transform: translate(-50%, -50%) scale(1); background: rgba(20, 184, 166, 0.35); animation: pulse-ring 1.8s ease-out infinite; }
+				.pulse-icon.paused .pulse-dot { background: #f59e0b; box-shadow: 0 0 0 rgba(245, 158, 11, 0.5); }
+				.pulse-icon.paused .pulse-dot::after { background: rgba(245, 158, 11, 0.35); }
 				.leaflet-div-icon.user-icon { background: transparent; border: none; }
 				.user-icon .user-dot { width: 14px; height: 14px; background: #3b82f6; border: 2px solid #ffffff; border-radius: 9999px; box-shadow: 0 0 0 rgba(59, 130, 246, 0.45); }
 				.leaflet-div-icon.dest-icon { background: transparent; border: none; }
