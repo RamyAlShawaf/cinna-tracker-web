@@ -6,6 +6,7 @@ const TileLayer = dynamic(() => import('react-leaflet').then(m => m.TileLayer), 
 const Marker = dynamic(() => import('react-leaflet').then(m => m.Marker), { ssr: false }) as any;
 const Popup = dynamic(() => import('react-leaflet').then(m => m.Popup), { ssr: false }) as any;
 const Polyline = dynamic(() => import('react-leaflet').then(m => m.Polyline), { ssr: false }) as any;
+const Circle = dynamic(() => import('react-leaflet').then(m => m.Circle), { ssr: false }) as any;
 import 'leaflet/dist/leaflet.css';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
@@ -256,7 +257,20 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	// Animate marker position between pings
 	useEffect(() => {
 		if (!point || typeof point.lat !== 'number' || typeof point.lng !== 'number') return;
-		const target = { lat: point.lat, lng: point.lng };
+		// Apply a small forward prediction based on speed/heading to compensate latency
+		const target = (() => {
+			if (typeof point.speed !== 'number' || typeof point.heading !== 'number') return { lat: point.lat, lng: point.lng };
+			const speed = Math.max(0, Math.min(point.speed || 0, 40)); // m/s clamp
+			const lookahead = 0.9; // seconds
+			const d = speed * lookahead; // meters
+			const brad = (point.heading || 0) * Math.PI / 180;
+			const R = 6378137; // meters
+			const lat1 = point.lat * Math.PI / 180;
+			const lng1 = point.lng * Math.PI / 180;
+			const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d / R) + Math.cos(lat1) * Math.sin(d / R) * Math.cos(brad));
+			const lng2 = lng1 + Math.atan2(Math.sin(brad) * Math.sin(d / R) * Math.cos(lat1), Math.cos(d / R) - Math.sin(lat1) * Math.sin(lat2));
+			return { lat: lat2 * 180 / Math.PI, lng: lng2 * 180 / Math.PI };
+		})();
 		// First point: snap and prime state
 		if (!display) {
 			setDisplay(target);
@@ -295,6 +309,40 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [point?.lat, point?.lng]);
 
+	// Snap the animated display to the current route if within a small threshold
+	const snappedDisplay = useMemo(() => {
+		if (!display || !point || point.status === 'paused') return display;
+		const coords = point.route?.coordinates || [];
+		if (!coords || coords.length < 2) return display;
+		// Local equirectangular projection around current latitude
+		const refLat = display.lat * Math.PI / 180;
+		const mPerDegLat = 111132.0;
+		const mPerDegLng = 111320.0 * Math.cos(refLat);
+		const toXY = (p: { lat: number; lng: number }) => ({ x: p.lng * mPerDegLng, y: p.lat * mPerDegLat });
+		const toLL = (x: number, y: number) => ({ lat: y / mPerDegLat, lng: x / mPerDegLng });
+		const P = toXY(display);
+		let best = display;
+		let bestDist = Number.POSITIVE_INFINITY;
+		for (let i = 0; i < coords.length - 1; i++) {
+			const A = toXY(coords[i]);
+			const B = toXY(coords[i + 1]);
+			const vx = B.x - A.x, vy = B.y - A.y;
+			const vlen2 = vx * vx + vy * vy;
+			let t = vlen2 === 0 ? 0 : ((P.x - A.x) * vx + (P.y - A.y) * vy) / vlen2;
+			if (t < 0) t = 0;
+			if (t > 1) t = 1;
+			const sx = A.x + t * vx, sy = A.y + t * vy;
+			const dx = P.x - sx, dy = P.y - sy;
+			const dist = Math.sqrt(dx * dx + dy * dy); // meters in projected space
+			if (dist < bestDist) {
+				bestDist = dist;
+				const ll = toLL(sx, sy);
+				best = { lat: ll.lat, lng: ll.lng };
+			}
+		}
+		return bestDist <= 25 ? best : display; // 25m snap threshold
+	}, [display?.lat, display?.lng, point?.status, point?.route?.coordinates]);
+
 	const waiting = (
 		<div className="absolute inset-0" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
 			<span className="text-sm text-muted">Waiting for first location…</span>
@@ -309,6 +357,34 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 
 	const hasCoords = !!(point && typeof point.lat === 'number' && typeof point.lng === 'number');
 	const statusLabel = point?.status === 'paused' ? 'Paused' : hasCoords ? 'Online' : 'Offline';
+
+	// Compute a displayRoute that starts at the animated display position and trims the backend route up to the nearest point
+	const displayRoute = useMemo(() => {
+		if (!point || point.status === 'paused') return [] as Array<[number, number]>;
+		const routeCoords = point.route?.coordinates || [];
+		if (!routeCoords || routeCoords.length === 0) return [] as Array<[number, number]>;
+		const head = snappedDisplay || display || (hasCoords ? { lat: point.lat, lng: point.lng } : null);
+		if (!head) return [] as Array<[number, number]>;
+		// Find nearest index in the route to the current head
+		let nearestIdx = 0;
+		let nearestScore = Number.POSITIVE_INFINITY;
+		for (let i = 0; i < routeCoords.length; i++) {
+			const dx = routeCoords[i].lat - head.lat;
+			const dy = routeCoords[i].lng - head.lng;
+			const score = dx * dx + dy * dy; // squared degrees distance; sufficient for choosing nearest index
+			if (score < nearestScore) {
+				nearestScore = score;
+				nearestIdx = i;
+			}
+		}
+		const trimmed: Array<[number, number]> = [];
+		trimmed.push([head.lat, head.lng]);
+		for (let i = nearestIdx + 1; i < routeCoords.length; i++) {
+			trimmed.push([routeCoords[i].lat, routeCoords[i].lng]);
+		}
+		return trimmed;
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [point?.status, point?.route?.coordinates, display?.lat, display?.lng, hasCoords, point?.lat, point?.lng]);
 
 	const infoOverlay = (
 		<div className="absolute left-0 right-0 bottom-0 p-0 sm:p-4 z-[401]" aria-live="polite">
@@ -396,9 +472,9 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 							</Popup>
 						</Marker>
 					)}
-					{point?.status !== 'paused' && point?.route?.coordinates && point.route.coordinates.length > 1 && (
+					{point?.status !== 'paused' && displayRoute.length > 1 && (
 						<Polyline
-							positions={point.route.coordinates.map(c => [c.lat, c.lng] as [number, number])}
+							positions={displayRoute}
 							pathOptions={{ color: (isDark ? '#ffffff' : '#000000'), weight: 4, opacity: 0.9 }}
 						/>
 					)}
@@ -412,7 +488,15 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 						/>
 					)}
 					{hasCoords && (
-						<Marker position={[(display?.lat ?? point!.lat), (display?.lng ?? point!.lng)] as [number, number]} icon={((point?.status === 'paused' ? pulseIconPaused : pulseIcon) || undefined) as any}>
+						<>
+						{(point?.status !== 'paused' && typeof point?.accuracy === 'number' && (snappedDisplay || display)) && (
+							<Circle
+								center={[(snappedDisplay?.lat ?? display!.lat), (snappedDisplay?.lng ?? display!.lng)] as [number, number]}
+								radius={Math.max(5, Math.min(Number(point.accuracy || 0), 150))}
+								pathOptions={{ color: (isDark ? '#22d3ee' : '#0ea5e9'), weight: 1, opacity: 0.35, fillOpacity: 0.1 }}
+							/>
+						)}
+						<Marker position={[(snappedDisplay?.lat ?? display?.lat ?? point!.lat), (snappedDisplay?.lng ?? display?.lng ?? point!.lng)] as [number, number]} icon={((point?.status === 'paused' ? pulseIconPaused : pulseIcon) || undefined) as any}>
 						<Popup>
 							<div className="text-sm">
 								<div>Lat: {Number(point!.lat).toFixed(5)}, Lng: {Number(point!.lng).toFixed(5)}</div>
@@ -421,6 +505,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 							</div>
 						</Popup>
 						</Marker>
+						</>
 					)}
 					</MapContainer>
 				);
