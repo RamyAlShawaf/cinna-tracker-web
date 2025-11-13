@@ -6,6 +6,8 @@
 
 -- Required extensions
 create extension if not exists pgcrypto;
+-- Background scheduling for idle session sweeps (optional but recommended)
+create extension if not exists pg_cron;
 
 -- ---------------------------------------------------------
 -- vehicles
@@ -397,6 +399,53 @@ begin
 end $$;
 
 grant execute on function public.set_vehicle_paused(uuid) to authenticated;
+
+-- ---------------------------------------------------------
+-- Watchdog: End sessions with no heartbeat for N seconds
+--   A heartbeat is any write to public.vehicle_live (ts updated)
+-- ---------------------------------------------------------
+create or replace function public.end_stale_vehicle_sessions(p_max_idle_seconds integer default 300)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_count int;
+begin
+  with stale as (
+    select s.id
+    from public.vehicle_sessions s
+    join public.vehicles v on v.id = s.vehicle_id
+    left join public.vehicle_live l on l.vehicle_id = v.id
+    where s.ended_at is null
+      and coalesce(l.ts, s.started_at) < now() - make_interval(secs => p_max_idle_seconds)
+  )
+  update public.vehicle_sessions s
+     set ended_at = now()
+   where s.id in (select id from stale)
+   ;
+
+  -- Number of rows ended in this call
+  get diagnostics v_count = row_count;
+
+  return coalesce(v_count, 0);
+end $$;
+
+-- Optional: allow calling from app if needed (primarily invoked by cron as service role)
+grant execute on function public.end_stale_vehicle_sessions(integer) to authenticated;
+
+-- Schedule the idle sweeper to run every minute (idempotent)
+do $$
+begin
+  if not exists (select 1 from cron.job where jobname = 'end_stale_vehicle_sessions_every_min') then
+    perform cron.schedule(
+      'end_stale_vehicle_sessions_every_min',
+      '*/1 * * * *',
+      'select public.end_stale_vehicle_sessions(300)'
+    );
+  end if;
+end $$;
 
 -- ---------------------------------------------------------
 -- trips and trip_stops (route scaffolding for end-user pathing)

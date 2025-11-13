@@ -36,6 +36,12 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const desiredVRef = useRef<number>(0); // m/s target speed
 	const desiredTargetSRef = useRef<number>(0); // eased target s
 	const emaSpeedRef = useRef<number>(0); // EMA smoothed speed
+	// Stationary gating state
+	const sHistRef = useRef<Array<{ s: number; t: number }>>([]);
+	const isStationaryRef = useRef<boolean>(false);
+	const speedThreshRef = useRef<number>(0.8); // m/s; below this likely stationary
+	const dispWindowSecRef = useRef<number>(5); // seconds window to assess displacement
+	const dispMetersThreshRef = useRef<number>(6); // if moved less than this over window -> stationary
 	// Teleport override animation to avoid instant jumps on route changes/large corrections
 	const teleportStartMsRef = useRef<number | null>(null);
 	const teleportDurMsRef = useRef<number>(800);
@@ -363,7 +369,9 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 			const dt = Math.max(0.001, Math.min(0.08, (now - last) / 1000));
 			last = now;
 			// Advance desired target along time with smoothed speed
-			desiredTargetSRef.current += Math.max(0, desiredVRef.current) * dt;
+			if (!isStationaryRef.current) {
+				desiredTargetSRef.current += Math.max(0, desiredVRef.current) * dt;
+			}
 			// Ease desiredS toward desiredTargetS
 			{
 				const errT = desiredTargetSRef.current - desiredSRef.current;
@@ -463,9 +471,33 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		emaSpeedRef.current = emaSpeedRef.current === 0 ? vPing : (emaSpeedRef.current * 0.85 + vPing * 0.15);
 		const vSmoothed = Math.max(0, Math.min(50, emaSpeedRef.current));
 		const leadSec = 0.9;
-		desiredVRef.current = vSmoothed;
-		// Ease target in the rAF loop by updating desiredTargetS only
-		desiredTargetSRef.current = sPing + vSmoothed * leadSec;
+		// Update stationary detector history
+		{
+			const nowT = serverNow;
+			const hist = sHistRef.current;
+			hist.push({ s: sPing, t: nowT });
+			// trim to last ~10s
+			while (hist.length > 0 && nowT - hist[0].t > 10000) hist.shift();
+			// compute displacement over dispWindowSec
+			const windowStartT = nowT - dispWindowSecRef.current * 1000;
+			let minS = sPing;
+			for (let i = hist.length - 1; i >= 0; i--) {
+				if (hist[i].t < windowStartT) break;
+				if (hist[i].s < minS) minS = hist[i].s;
+			}
+			const disp = Math.max(0, sPing - minS);
+			const stationary = (vSmoothed < speedThreshRef.current) && (disp < dispMetersThreshRef.current);
+			isStationaryRef.current = stationary;
+		}
+		// Apply gating
+		if (isStationaryRef.current) {
+			desiredVRef.current = 0;
+			desiredTargetSRef.current = sPing; // no lookahead when stationary
+		} else {
+			desiredVRef.current = vSmoothed;
+			// Ease target in the rAF loop by updating desiredTargetS only
+			desiredTargetSRef.current = sPing + vSmoothed * leadSec;
+		}
 		// If correction is very large (e.g., GPS jump), blend visually instead of snapping
 		const bigJump = Math.abs(desiredTargetSRef.current - currentSRef.current) > 120; // meters
 		if (bigJump && routeParam && display) {
