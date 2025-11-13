@@ -6,14 +6,15 @@
     "dev": "next dev -H 0.0.0.0",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "simulate:routeA": "node scripts/ghostRouteA.js"
   },
   "dependencies": {
     "@supabase/ssr": "^0.7.0",
-    "@supabase/supabase-js": "^2.76.1",
-    "jose": "^6.1.0",
+    "@supabase/supabase-js": "^2.81.1",
+    "jose": "^6.1.1",
     "leaflet": "^1.9.4",
-    "next": "16.0.0",
+    "next": "16.0.2",
     "qrcode": "^1.5.4",
     "react": "19.2.0",
     "react-dom": "19.2.0",
@@ -23,11 +24,11 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/leaflet": "^1.9.21",
-    "@types/node": "^20",
+    "@types/node": "^24",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.0.0",
+    "eslint-config-next": "16.0.2",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

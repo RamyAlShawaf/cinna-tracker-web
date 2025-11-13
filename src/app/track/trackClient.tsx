@@ -6,7 +6,6 @@ const TileLayer = dynamic(() => import('react-leaflet').then(m => m.TileLayer), 
 const Marker = dynamic(() => import('react-leaflet').then(m => m.Marker), { ssr: false }) as any;
 const Popup = dynamic(() => import('react-leaflet').then(m => m.Popup), { ssr: false }) as any;
 const Polyline = dynamic(() => import('react-leaflet').then(m => m.Polyline), { ssr: false }) as any;
-const Circle = dynamic(() => import('react-leaflet').then(m => m.Circle), { ssr: false }) as any;
 import 'leaflet/dist/leaflet.css';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
@@ -31,6 +30,21 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const [point, setPoint] = useState<LivePoint | null>(null);
 	// Interpolated display position for smooth marker animation
 	const [display, setDisplay] = useState<{ lat: number; lng: number } | null>(null);
+	// Animated pose is driven by a path-parameter s (meters) along the current route
+	const currentSRef = useRef<number>(0);
+	const desiredSRef = useRef<number>(0);
+	const desiredVRef = useRef<number>(0); // m/s target speed
+	const desiredTargetSRef = useRef<number>(0); // eased target s
+	const emaSpeedRef = useRef<number>(0); // EMA smoothed speed
+	// Teleport override animation to avoid instant jumps on route changes/large corrections
+	const teleportStartMsRef = useRef<number | null>(null);
+	const teleportDurMsRef = useRef<number>(800);
+	const teleportFromRef = useRef<{ lat: number; lng: number } | null>(null);
+	const teleportToRef = useRef<{ lat: number; lng: number } | null>(null);
+	const clockSkewMsRef = useRef<number>(0); // server_time - client_time EMA
+	const prevSPingRef = useRef<number | null>(null);
+	const prevPingServerMsRef = useRef<number | null>(null);
+	const rafIdRef = useRef<number | null>(null);
 	const [vehicleId, setVehicleId] = useState<string | null>(null);
 	const [vehicleLabel, setVehicleLabel] = useState<string | null>(null);
 	const [vehiclePhotoUrl, setVehiclePhotoUrl] = useState<string | null>(null);
@@ -82,6 +96,84 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		})();
 		return () => { mounted = false; };
 	}, []);
+
+	// Route parameterization: precompute cumulative distances and helpers when route changes
+	const routeParam = useMemo(() => {
+		const coords = point?.route?.coordinates || [];
+		if (!coords || coords.length < 2) return null as null | {
+			coords: Array<{ lat: number; lng: number }>;
+			cum: number[];
+			length: number;
+			toXY: (p: { lat: number; lng: number }) => { x: number; y: number };
+			toLL: (x: number, y: number) => { lat: number; lng: number };
+			positionAtS: (s: number) => { lat: number; lng: number };
+			projectPointToS: (lat: number, lng: number) => { s: number; lat: number; lng: number; idx: number; t: number };
+		};
+		// Local equirectangular projection around first point
+		const refLatRad = (coords[0].lat || 0) * Math.PI / 180;
+		const mPerDegLat = 111132.0;
+		const mPerDegLng = 111320.0 * Math.cos(refLatRad);
+		const toXY = (p: { lat: number; lng: number }) => ({ x: p.lng * mPerDegLng, y: p.lat * mPerDegLat });
+		const toLL = (x: number, y: number) => ({ lat: y / mPerDegLat, lng: x / mPerDegLng });
+		const xy = coords.map(toXY);
+		const cum: number[] = [0];
+		let total = 0;
+		for (let i = 0; i < xy.length - 1; i++) {
+			const dx = xy[i + 1].x - xy[i].x;
+			const dy = xy[i + 1].y - xy[i].y;
+			const d = Math.hypot(dx, dy);
+			total += d;
+			cum.push(total);
+		}
+		const length = total;
+		const positionAtS = (s: number) => {
+			if (length <= 0) return coords[0];
+			let ss = Math.max(0, Math.min(length, s));
+			// Find segment
+			let i = 0;
+			while (i < cum.length - 1 && cum[i + 1] < ss) i++;
+			const segStartS = cum[i];
+			const segLen = Math.max(1e-6, cum[i + 1] - segStartS);
+			const t = (ss - segStartS) / segLen;
+			const Ax = xy[i].x, Ay = xy[i].y;
+			const Bx = xy[i + 1].x, By = xy[i + 1].y;
+			const x = Ax + (Bx - Ax) * t;
+			const y = Ay + (By - Ay) * t;
+			return toLL(x, y);
+		};
+		const projectPointToS = (lat: number, lng: number) => {
+			const P = toXY({ lat, lng });
+			let bestIdx = 0;
+			let bestT = 0;
+			let bestDist = Number.POSITIVE_INFINITY;
+			for (let i = 0; i < xy.length - 1; i++) {
+				const Ax = xy[i].x, Ay = xy[i].y;
+				const Bx = xy[i + 1].x, By = xy[i + 1].y;
+				const vx = Bx - Ax, vy = By - Ay;
+				const vlen2 = vx * vx + vy * vy;
+				let t = vlen2 === 0 ? 0 : ((P.x - Ax) * vx + (P.y - Ay) * vy) / vlen2;
+				if (t < 0) t = 0;
+				if (t > 1) t = 1;
+				const sx = Ax + t * vx, sy = Ay + t * vy;
+				const dx = P.x - sx, dy = P.y - sy;
+				const dist = Math.sqrt(dx * dx + dy * dy);
+				if (dist < bestDist) {
+					bestDist = dist;
+					bestIdx = i;
+					bestT = t;
+				}
+			}
+			const segLen = Math.max(1e-6, cum[bestIdx + 1] - cum[bestIdx]);
+			const s = cum[bestIdx] + segLen * bestT;
+			const Ax = xy[bestIdx].x, Ay = xy[bestIdx].y;
+			const Bx = xy[bestIdx + 1].x, By = xy[bestIdx + 1].y;
+			const sx = Ax + (Bx - Ax) * bestT, sy = Ay + (By - Ay) * bestT;
+			const ll = toLL(sx, sy);
+			return { s, lat: ll.lat, lng: ll.lng, idx: bestIdx, t: bestT };
+		};
+		return { coords, cum, length, toXY, toLL, positionAtS, projectPointToS };
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [point?.route?.coordinates]);
 
 	const pulseIcon = useMemo(() => {
 		if (!leaflet) return null;
@@ -230,18 +322,17 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	}, [vehicleId, supabase]);
 
 	useEffect(() => {
-		// Smoothly move the map center when a new target point arrives
-		if (!mapRef.current || !point) return;
-		if (typeof point.lat !== 'number' || typeof point.lng !== 'number') return;
+		// Follow animated head to reduce perceived jitter
+		if (!mapRef.current || !display) return;
 		try {
 			const z = mapRef.current.getZoom ? mapRef.current.getZoom() : 15;
-			if (mapRef.current.flyTo) {
-				mapRef.current.flyTo([point.lat, point.lng], z, { duration: 0.9 });
-			} else if (mapRef.current.panTo) {
-				mapRef.current.panTo([point.lat, point.lng], { animate: true });
+			if (mapRef.current.panTo) {
+				mapRef.current.panTo([display.lat, display.lng], { animate: true });
+			} else if (mapRef.current.setView) {
+				mapRef.current.setView([display.lat, display.lng], z, { animate: true });
 			}
 		} catch {}
-	}, [point]);
+	}, [display?.lat, display?.lng]);
 
 	// Center to user's location once on load if permission granted
 	useEffect(() => {
@@ -254,64 +345,155 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		} catch {}
 	}, [userPos]);
 
-	// Animate marker position between pings
+	// Animate marker position: path-parameterized rAF loop for fluid motion
 	useEffect(() => {
-		if (!point || typeof point.lat !== 'number' || typeof point.lng !== 'number') return;
-		// Apply a small forward prediction based on speed/heading to compensate latency
-		const target = (() => {
-			if (typeof point.speed !== 'number' || typeof point.heading !== 'number') return { lat: point.lat, lng: point.lng };
-			const speed = Math.max(0, Math.min(point.speed || 0, 40)); // m/s clamp
-			const lookahead = 0.9; // seconds
-			const d = speed * lookahead; // meters
-			const brad = (point.heading || 0) * Math.PI / 180;
-			const R = 6378137; // meters
-			const lat1 = point.lat * Math.PI / 180;
-			const lng1 = point.lng * Math.PI / 180;
-			const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d / R) + Math.cos(lat1) * Math.sin(d / R) * Math.cos(brad));
-			const lng2 = lng1 + Math.atan2(Math.sin(brad) * Math.sin(d / R) * Math.cos(lat1), Math.cos(d / R) - Math.sin(lat1) * Math.sin(lat2));
-			return { lat: lat2 * 180 / Math.PI, lng: lng2 * 180 / Math.PI };
-		})();
-		// First point: snap and prime state
-		if (!display) {
-			setDisplay(target);
+		// If we have a route, run the path-based renderer; otherwise fall back to simple snapping
+		if (!routeParam) {
+			// Fallback: snap to latest point (will still be stepped by ping cadence)
+			if (point && typeof point.lat === 'number' && typeof point.lng === 'number') {
+				setDisplay({ lat: point.lat, lng: point.lng });
+			}
 			return;
 		}
-		// Start a new animation from current displayed position to target
-		animFromRef.current = display;
-		animToRef.current = target;
-		animStartRef.current = performance.now();
-		const duration = animDurationMsRef.current;
-		const easeInOutCubic = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
-		if (animRafRef.current) cancelAnimationFrame(animRafRef.current);
-		const tick = () => {
-			const now = performance.now();
-			let t = (now - animStartRef.current) / duration;
-			if (t >= 1) {
-				setDisplay(animToRef.current!);
-				animRafRef.current = null;
-				return;
+		let last = performance.now();
+		const tau = 0.28; // response for currentS -> desiredS
+		const tauTarget = 0.40; // response for desiredS -> desiredTargetS
+		const extraSpeed = 4; // extra m/s available to catch up corrections
+		const loop = (now: number) => {
+			const dt = Math.max(0.001, Math.min(0.08, (now - last) / 1000));
+			last = now;
+			// Advance desired target along time with smoothed speed
+			desiredTargetSRef.current += Math.max(0, desiredVRef.current) * dt;
+			// Ease desiredS toward desiredTargetS
+			{
+				const errT = desiredTargetSRef.current - desiredSRef.current;
+				const alphaT = 1 - Math.exp(-dt / tauTarget);
+				desiredSRef.current += errT * alphaT;
 			}
-			t = Math.max(0, Math.min(1, t));
-			t = easeInOutCubic(t);
-			const from = animFromRef.current!;
-			const to = animToRef.current!;
-			setDisplay({
-				lat: from.lat + (to.lat - from.lat) * t,
-				lng: from.lng + (to.lng - from.lng) * t,
-			});
-			animRafRef.current = requestAnimationFrame(tick);
+			// Smoothly move current toward desired, limiting per-frame speed
+			const targetS = desiredSRef.current;
+			const s = currentSRef.current;
+			const err = targetS - s;
+			const alpha = 1 - Math.exp(-dt / tau);
+			const maxV = Math.max(2, Math.min(50, desiredVRef.current + extraSpeed)); // m/s
+			const maxStep = maxV * dt;
+			const step = Math.max(-maxStep, Math.min(maxStep, err * alpha * 1.5));
+			currentSRef.current = s + step;
+			// Emit display
+			let pos = routeParam.positionAtS(currentSRef.current);
+			// If a teleport override is active, blend position to avoid instant jump
+			if (teleportStartMsRef.current != null && teleportFromRef.current && teleportToRef.current) {
+				const t = Math.max(0, Math.min(1, (performance.now() - teleportStartMsRef.current) / teleportDurMsRef.current));
+				// easeInOutCubic
+				const tt = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+				pos = {
+					lat: teleportFromRef.current.lat + (teleportToRef.current.lat - teleportFromRef.current.lat) * tt,
+					lng: teleportFromRef.current.lng + (teleportToRef.current.lng - teleportFromRef.current.lng) * tt,
+				};
+				if (t >= 1) {
+					teleportStartMsRef.current = null;
+					teleportFromRef.current = null;
+					teleportToRef.current = null;
+				}
+			}
+			setDisplay(pos);
+			rafIdRef.current = requestAnimationFrame(loop);
 		};
-		animRafRef.current = requestAnimationFrame(tick);
+		rafIdRef.current = requestAnimationFrame(loop);
 		return () => {
-			if (animRafRef.current) cancelAnimationFrame(animRafRef.current);
-			animRafRef.current = null;
+			if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+			rafIdRef.current = null;
 		};
 	// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [point?.lat, point?.lng]);
+	}, [routeParam, point?.lat, point?.lng]);
+
+	// On route change, re-project current head to the new route to avoid jumps
+	useEffect(() => {
+		if (!routeParam) return;
+		const head = display || (point && typeof point.lat === 'number' && typeof point.lng === 'number' ? { lat: point.lat, lng: point.lng } : null);
+		if (!head) return;
+		const proj = routeParam.projectPointToS(head.lat, head.lng);
+		// Plan a short teleport-blend from current visual position to the nearest point on the new route
+		const to = routeParam.positionAtS(proj.s);
+		if (display) {
+			teleportFromRef.current = display;
+			teleportToRef.current = to;
+			// Duration based on distance (15–1000ms per 10m, clamped 500–1400ms)
+			const mPerDegLat = 111132.0;
+			const mPerDegLng = 111320.0 * Math.cos((display.lat * Math.PI) / 180);
+			const dx = (to.lng - display.lng) * mPerDegLng;
+			const dy = (to.lat - display.lat) * mPerDegLat;
+			const dist = Math.sqrt(dx * dx + dy * dy);
+			teleportDurMsRef.current = Math.max(500, Math.min(1400, (dist / 10) * 150));
+			teleportStartMsRef.current = performance.now();
+		}
+		// Align s targets to the new route; rAF will render using teleport blend
+		currentSRef.current = proj.s;
+		desiredSRef.current = proj.s;
+		desiredTargetSRef.current = proj.s;
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [routeParam]);
+
+	// On each live ping: project onto path, estimate speed, update targets
+	useEffect(() => {
+		if (!point) return;
+		// Update clock skew (EMA) from server timestamp if present
+		if (point.ts) {
+			const serverMs = new Date(point.ts).getTime();
+			const offset = serverMs - Date.now();
+			clockSkewMsRef.current = clockSkewMsRef.current * 0.9 + offset * 0.1;
+		}
+		if (!routeParam || typeof point.lat !== 'number' || typeof point.lng !== 'number') {
+			// Without a route, just snap display; rAF fallback will keep it steady
+			setDisplay({ lat: point.lat as number, lng: point.lng as number });
+			return;
+		}
+		const proj = routeParam.projectPointToS(point.lat!, point.lng!);
+		const sPing = proj.s;
+		const serverNow = point.ts ? new Date(point.ts).getTime() : (Date.now() + clockSkewMsRef.current);
+		let vPing = typeof point.speed === 'number' ? Math.max(0, Math.min(point.speed || 0, 50)) : 0;
+		if (!vPing && prevSPingRef.current != null && prevPingServerMsRef.current != null) {
+			const ds = sPing - prevSPingRef.current;
+			const dt = Math.max(0.2, (serverNow - prevPingServerMsRef.current) / 1000);
+			vPing = Math.max(0, Math.min(50, ds / dt));
+		}
+		prevSPingRef.current = sPing;
+		prevPingServerMsRef.current = serverNow;
+		// Smooth speed with EMA to reduce jitter
+		emaSpeedRef.current = emaSpeedRef.current === 0 ? vPing : (emaSpeedRef.current * 0.85 + vPing * 0.15);
+		const vSmoothed = Math.max(0, Math.min(50, emaSpeedRef.current));
+		const leadSec = 0.9;
+		desiredVRef.current = vSmoothed;
+		// Ease target in the rAF loop by updating desiredTargetS only
+		desiredTargetSRef.current = sPing + vSmoothed * leadSec;
+		// If correction is very large (e.g., GPS jump), blend visually instead of snapping
+		const bigJump = Math.abs(desiredTargetSRef.current - currentSRef.current) > 120; // meters
+		if (bigJump && routeParam && display) {
+			const to = routeParam.positionAtS(sPing);
+			teleportFromRef.current = display;
+			teleportToRef.current = to;
+			const mPerDegLat = 111132.0;
+			const mPerDegLng = 111320.0 * Math.cos((display.lat * Math.PI) / 180);
+			const dx = (to.lng - display.lng) * mPerDegLng;
+			const dy = (to.lat - display.lat) * mPerDegLat;
+			const dist = Math.sqrt(dx * dx + dy * dy);
+			teleportDurMsRef.current = Math.max(450, Math.min(1200, (dist / 10) * 120));
+			teleportStartMsRef.current = performance.now();
+		}
+		// First-time initialization of display
+		if (!display) {
+			currentSRef.current = sPing;
+			desiredSRef.current = sPing;
+			desiredTargetSRef.current = sPing + vSmoothed * leadSec;
+			setDisplay(routeParam.positionAtS(sPing));
+		}
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [point?.lat, point?.lng, point?.ts, routeParam]);
 
 	// Snap the animated display to the current route if within a small threshold
 	const snappedDisplay = useMemo(() => {
-		if (!display || !point || point.status === 'paused') return display;
+		// If rendering along a route, avoid re-projecting per frame (prevents micro jitter)
+		if (!display || !point || point.status === 'paused' || ((point.route?.coordinates?.length || 0) >= 2)) return display;
 		const coords = point.route?.coordinates || [];
 		if (!coords || coords.length < 2) return display;
 		// Local equirectangular projection around current latitude
@@ -488,14 +670,6 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 						/>
 					)}
 					{hasCoords && (
-						<>
-						{(point?.status !== 'paused' && typeof point?.accuracy === 'number' && (snappedDisplay || display)) && (
-							<Circle
-								center={[(snappedDisplay?.lat ?? display!.lat), (snappedDisplay?.lng ?? display!.lng)] as [number, number]}
-								radius={Math.max(5, Math.min(Number(point.accuracy || 0), 150))}
-								pathOptions={{ color: (isDark ? '#22d3ee' : '#0ea5e9'), weight: 1, opacity: 0.35, fillOpacity: 0.1 }}
-							/>
-						)}
 						<Marker position={[(snappedDisplay?.lat ?? display?.lat ?? point!.lat), (snappedDisplay?.lng ?? display?.lng ?? point!.lng)] as [number, number]} icon={((point?.status === 'paused' ? pulseIconPaused : pulseIcon) || undefined) as any}>
 						<Popup>
 							<div className="text-sm">
@@ -505,7 +679,6 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 							</div>
 						</Popup>
 						</Marker>
-						</>
 					)}
 					</MapContainer>
 				);

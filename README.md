@@ -29,5 +29,28 @@ npm run dev
 - Visit `/admin` to manage vehicles, generate and download QR codes.
 
 ## User
+ 
+- Visit `/track/ONX-102` to view live map; replace code accordingly.
 
-- Visit `/track?v=ONX-102` to view live map; replace code accordingly.
+## Simulator (Ghost Bus on Route A)
+
+Simulate a vehicle moving along Route A (London → Mississauga) for testing the tracker UI.
+
+1) Make sure the dev server is running and your DB has a vehicle with public code `YUG-199`.
+2) Run the simulator:
+
+```
+npm run simulate:routeA
+```
+
+Optional environment overrides:
+
+```
+BASE_URL=http://localhost:3000 SPEED_KMH=60 LOOP=true npm run simulate:routeA
+```
+
+Then open the tracker at:
+
+```
+/track/YUG-199
+```
