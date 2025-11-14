@@ -323,7 +323,8 @@ begin
         speed    = excluded.speed,
         heading  = excluded.heading,
         accuracy = excluded.accuracy,
-        route    = excluded.route,
+        -- Do not clear route when client omits it or sends null in heartbeat/ping
+        route    = coalesce(excluded.route, public.vehicle_live.route),
         status   = 'online',
         ts       = excluded.ts;
 end $$;

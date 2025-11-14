@@ -25,6 +25,29 @@ const TICK_MS = Number(process.env.TICK_MS || 1000); // send a ping roughly ever
 const A_START = { lat: 42.9814206, lng: -81.2465922 }; // London, York Street
 const A_END   = { lat: 43.6159874, lng: -79.7018163 }; // Mississauga, Bancroft Drive
 
+function numEnv(name, fallback) {
+  const v = process.env[name];
+  if (v == null || v === '') return fallback;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+// Allow overriding start/end via env for alternate test routes
+const START = {
+  lat: numEnv('START_LAT', A_START.lat),
+  lng: numEnv('START_LNG', A_START.lng),
+};
+// Movement end (where the marker drives to). Back-compat: END_* aliases MOVE_END_*.
+const MOVE_END = {
+  lat: numEnv('MOVE_END_LAT', numEnv('END_LAT', A_END.lat)),
+  lng: numEnv('MOVE_END_LNG', numEnv('END_LNG', A_END.lng)),
+};
+// Route polyline end (where the displayed route points to). Defaults to MOVE_END if not set.
+const ROUTE_END = {
+  lat: numEnv('ROUTE_END_LAT', MOVE_END.lat),
+  lng: numEnv('ROUTE_END_LNG', MOVE_END.lng),
+};
+
 // Utilities
 function toRad(deg) { return (deg * Math.PI) / 180; }
 function toDeg(rad) { return (rad * 180) / Math.PI; }
@@ -118,12 +141,16 @@ async function ping(token, sample) {
 
 async function main() {
   console.log(`[sim] BASE_URL=${BASE_URL} PUBLIC_CODE=${PUBLIC_CODE} SPEED_KMH=${SPEED_KMH} LOOP=${LOOP}`);
+  console.log(`[sim] START=(${START.lat.toFixed(6)}, ${START.lng.toFixed(6)}) MOVE_END=(${MOVE_END.lat.toFixed(6)}, ${MOVE_END.lng.toFixed(6)}) ROUTE_END=(${ROUTE_END.lat.toFixed(6)}, ${ROUTE_END.lng.toFixed(6)})`);
   const { publish_token, vehicle_id } = await startSession();
   console.log(`[sim] started session, vehicle_id=${vehicle_id}`);
 
-  // Build a road-following route polyline between the two stops
-  const forward = await getRoadRoute(A_START, A_END);
-  const backward = [...forward].reverse();
+  // Build road-following paths:
+  // - moveForward: path the marker follows
+  // - routeForward: polyline shown in the UI (can be different destination)
+  const moveForward = await getRoadRoute(START, MOVE_END);
+  const routeForward = await getRoadRoute(START, ROUTE_END);
+  const moveBackward = [...moveForward].reverse();
 
   // Convert speed to m/s
   const speedMps = Math.max(1, (SPEED_KMH * 1000) / 3600);
@@ -132,25 +159,26 @@ async function main() {
   let trip = 0;
   while (true) {
     trip++;
-    console.log(`[sim] trip ${trip} forward (${forward.length} points)`);
-    await runOneLeg(publish_token, forward);
+    console.log(`[sim] trip ${trip} forward (move=${moveForward.length} pts, route=${routeForward.length} pts)`);
+    await runOneLeg(publish_token, moveForward, routeForward);
     if (!LOOP) break;
-    console.log(`[sim] trip ${trip} backward (${backward.length} points)`);
-    await runOneLeg(publish_token, backward);
+    console.log(`[sim] trip ${trip} backward (move=${moveBackward.length} pts, route=${routeForward.length} pts)`);
+    await runOneLeg(publish_token, moveBackward, routeForward);
   }
   console.log('[sim] done');
 }
 
-async function runOneLeg(token, coords) {
+async function runOneLeg(token, moveCoords, routeCoords) {
   // Publish along the provided coordinates
   // Include the full remaining route in each payload so web UI can render the polyline and destination
-  for (let i = 0; i < coords.length; i++) {
-    const here = coords[i];
-    const next = coords[Math.min(i + 1, coords.length - 1)];
+  for (let i = 0; i < moveCoords.length; i++) {
+    const here = moveCoords[i];
+    const next = moveCoords[Math.min(i + 1, moveCoords.length - 1)];
     const segDist = Math.max(1, haversineMeters(here, next));
     const segHeading = bearingDeg(here, next);
     const dtSec = Math.max(0.8, segDist / speedMps()); // time to next point at current speed
-    const route = { coordinates: coords.slice(i).map(p => ({ lat: p.lat, lng: p.lng })) };
+    // Provide the full route polyline; the web trims it client-side near the current head.
+    const route = { coordinates: routeCoords.map(p => ({ lat: p.lat, lng: p.lng })) };
     const sample = {
       lat: here.lat,
       lng: here.lng,

@@ -30,6 +30,9 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const [point, setPoint] = useState<LivePoint | null>(null);
 	// Interpolated display position for smooth marker animation
 	const [display, setDisplay] = useState<{ lat: number; lng: number } | null>(null);
+	// Raw sample buffer with fixed render delay (no prediction/map-matching)
+	const samplesRef = useRef<Array<{ lat: number; lng: number; t: number }>>([]);
+	const renderDelayMsRef = useRef<number>(5000);
 	// Animated pose is driven by a path-parameter s (meters) along the current route
 	const currentSRef = useRef<number>(0);
 	const desiredSRef = useRef<number>(0);
@@ -51,6 +54,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const prevSPingRef = useRef<number | null>(null);
 	const prevPingServerMsRef = useRef<number | null>(null);
 	const rafIdRef = useRef<number | null>(null);
+	const lastHeadingRef = useRef<number | null>(null);
 	const [vehicleId, setVehicleId] = useState<string | null>(null);
 	const [vehicleLabel, setVehicleLabel] = useState<string | null>(null);
 	const [vehiclePhotoUrl, setVehiclePhotoUrl] = useState<string | null>(null);
@@ -58,6 +62,8 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const [status, setStatus] = useState<string>('');
 	const [leaflet, setLeaflet] = useState<any>(null);
 	const [isDark, setIsDark] = useState(true);
+	// Client-side route override (recalc when off-route)
+	const [overrideRoute, setOverrideRoute] = useState<Array<{ lat: number; lng: number }> | null>(null);
 	const [userPos, setUserPos] = useState<{ lat: number; lng: number } | null>(null);
 	const mapRef = useRef<any>(null);
 	const animRafRef = useRef<number | null>(null);
@@ -67,6 +73,11 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const animDurationMsRef = useRef<number>(900);
 	const centeredOnUserRef = useRef<boolean>(false);
 	const geoWatchIdRef = useRef<number | null>(null);
+	const routeFetchInFlightRef = useRef<boolean>(false);
+	const lastRouteFetchAtRef = useRef<number>(0);
+	// Throttle map recentering to avoid starting a new pan animation every frame
+	const lastPanAtRef = useRef<number>(0);
+	// Client override route remains active until superseded by a new reroute (never auto-cleared)
 	const maptilerKey = process.env.NEXT_PUBLIC_MAPTILER_KEY;
 	const mapStyleDark = process.env.NEXT_PUBLIC_MAP_STYLE_DARK || process.env.NEXT_PUBLIC_MAP_STYLE || 'basic-v2-dark';
 	const mapStyleLight = process.env.NEXT_PUBLIC_MAP_STYLE_LIGHT || 'basic-v2';
@@ -93,6 +104,9 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		return createClient(url, anon);
 	}, []);
 	const timerRef = useRef<NodeJS.Timeout | null>(null);
+	const nearestFetchInFlightRef = useRef<boolean>(false);
+	const lastNearestAtRef = useRef<number>(0);
+	const snappedRoadRef = useRef<{ lat: number; lng: number; meters: number } | null>(null);
 
 	useEffect(() => {
 		let mounted = true;
@@ -181,27 +195,19 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [point?.route?.coordinates]);
 
-	const pulseIcon = useMemo(() => {
-		if (!leaflet) return null;
-		return leaflet.divIcon({
-			className: 'pulse-icon',
-			html: '<div class="pulse-dot"></div>',
-			iconSize: [28, 28],
-			iconAnchor: [14, 14],
-			popupAnchor: [0, -12],
-		});
-	}, [leaflet]);
+	// Bearing helper
+	const bearingDeg = (a: { lat: number; lng: number }, b: { lat: number; lng: number }) => {
+		const toRad = (d: number) => (d * Math.PI) / 180;
+		const toDeg = (r: number) => (r * 180) / Math.PI;
+		const lat1 = toRad(a.lat), lat2 = toRad(b.lat);
+		const dLon = toRad(b.lng - a.lng);
+		const y = Math.sin(dLon) * Math.cos(lat2);
+		const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+		const br = toDeg(Math.atan2(y, x));
+		return (br + 360) % 360;
+	};
 
-	const pulseIconPaused = useMemo(() => {
-		if (!leaflet) return null;
-		return leaflet.divIcon({
-			className: 'pulse-icon paused',
-			html: '<div class="pulse-dot"></div>',
-			iconSize: [28, 28],
-			iconAnchor: [14, 14],
-			popupAnchor: [0, -12],
-		});
-	}, [leaflet]);
+	// displayHeading and pulsing icons will be defined after displayRoute
 
 	const userIcon = useMemo(() => {
 		if (!leaflet) return null;
@@ -256,7 +262,12 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
             const r = await fetch(`/api/vehicle/${encodeURIComponent(code)}/last`);
 			if (r.ok) {
 				const data = await r.json();
-              if (mounted) setPoint(data);
+              if (mounted) {
+				setPoint(data);
+				// seed buffer with last known sample
+				const t = data?.ts ? new Date(data.ts).getTime() : Date.now();
+				samplesRef.current.push({ lat: data.lat, lng: data.lng, t });
+			  }
 			} else {
 				// No live row -> offline
 				if (mounted) {
@@ -297,6 +308,12 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 					}
 					const row = (payload.new || payload.record || payload) as any;
 					if (!row || row.lat == null || row.lng == null) return;
+					// update clock skew
+					if (row.ts) {
+						const serverMs = new Date(row.ts).getTime();
+						const offset = serverMs - Date.now();
+						clockSkewMsRef.current = clockSkewMsRef.current * 0.9 + offset * 0.1;
+					}
 					setPoint({
 						lat: row.lat,
 						lng: row.lng,
@@ -307,6 +324,20 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 						ts: row.ts,
 						route: row.route || null,
 					});
+					// append to raw samples buffer
+					const t = row.ts ? new Date(row.ts).getTime() : (Date.now() + clockSkewMsRef.current);
+					const buf = samplesRef.current;
+					if (!buf.length || t >= buf[buf.length - 1].t) {
+						buf.push({ lat: row.lat, lng: row.lng, t });
+					} else {
+						// out-of-order: insert sorted
+						let i = buf.findIndex(s => s.t > t);
+						if (i === -1) buf.push({ lat: row.lat, lng: row.lng, t });
+						else buf.splice(i, 0, { lat: row.lat, lng: row.lng, t });
+					}
+					// trim to last ~2 minutes
+					const cutoff = (Date.now() + clockSkewMsRef.current) - 120000;
+					while (buf.length > 0 && buf[0].t < cutoff) buf.shift();
 					setStatus('');
 				}
 			)
@@ -328,15 +359,28 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	}, [vehicleId, supabase]);
 
 	useEffect(() => {
-		// Follow animated head to reduce perceived jitter
+		// Follow the animated head, but throttle panning to prevent constant animation restarts
 		if (!mapRef.current || !display) return;
 		try {
-			const z = mapRef.current.getZoom ? mapRef.current.getZoom() : 15;
-			if (mapRef.current.panTo) {
-				mapRef.current.panTo([display.lat, display.lng], { animate: true });
-			} else if (mapRef.current.setView) {
-				mapRef.current.setView([display.lat, display.lng], z, { animate: true });
+			const map = mapRef.current;
+			const now = performance.now();
+			const minIntervalMs = 600; // don't start a new pan more than ~1.6x per second
+			if ((now - lastPanAtRef.current) < minIntervalMs) return;
+			if (map.latLngToContainerPoint && map.getCenter) {
+				const center = map.getCenter();
+				const c = map.latLngToContainerPoint([center.lat, center.lng]);
+				const t = map.latLngToContainerPoint([display.lat, display.lng]);
+				const distPx = Math.hypot(t.x - c.x, t.y - c.y);
+				const thresholdPx = 60; // only pan if marker moved noticeably from center
+				if (distPx <= thresholdPx) return;
 			}
+			const z = map.getZoom ? map.getZoom() : 15;
+			if (map.panTo) {
+				map.panTo([display.lat, display.lng], { animate: true });
+			} else if (map.setView) {
+				map.setView([display.lat, display.lng], z, { animate: true });
+			}
+			lastPanAtRef.current = now;
 		} catch {}
 	}, [display?.lat, display?.lng]);
 
@@ -351,60 +395,38 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		} catch {}
 	}, [userPos]);
 
-	// Animate marker position: path-parameterized rAF loop for fluid motion
+	// Animate marker position using fixed-lag interpolation over raw samples
 	useEffect(() => {
-		// If we have a route, run the path-based renderer; otherwise fall back to simple snapping
-		if (!routeParam) {
-			// Fallback: snap to latest point (will still be stepped by ping cadence)
-			if (point && typeof point.lat === 'number' && typeof point.lng === 'number') {
-				setDisplay({ lat: point.lat, lng: point.lng });
-			}
-			return;
-		}
 		let last = performance.now();
-		const tau = 0.28; // response for currentS -> desiredS
-		const tauTarget = 0.40; // response for desiredS -> desiredTargetS
-		const extraSpeed = 4; // extra m/s available to catch up corrections
 		const loop = (now: number) => {
 			const dt = Math.max(0.001, Math.min(0.08, (now - last) / 1000));
 			last = now;
-			// Advance desired target along time with smoothed speed
-			if (!isStationaryRef.current) {
-				desiredTargetSRef.current += Math.max(0, desiredVRef.current) * dt;
-			}
-			// Ease desiredS toward desiredTargetS
-			{
-				const errT = desiredTargetSRef.current - desiredSRef.current;
-				const alphaT = 1 - Math.exp(-dt / tauTarget);
-				desiredSRef.current += errT * alphaT;
-			}
-			// Smoothly move current toward desired, limiting per-frame speed
-			const targetS = desiredSRef.current;
-			const s = currentSRef.current;
-			const err = targetS - s;
-			const alpha = 1 - Math.exp(-dt / tau);
-			const maxV = Math.max(2, Math.min(50, desiredVRef.current + extraSpeed)); // m/s
-			const maxStep = maxV * dt;
-			const step = Math.max(-maxStep, Math.min(maxStep, err * alpha * 1.5));
-			currentSRef.current = s + step;
-			// Emit display
-			let pos = routeParam.positionAtS(currentSRef.current);
-			// If a teleport override is active, blend position to avoid instant jump
-			if (teleportStartMsRef.current != null && teleportFromRef.current && teleportToRef.current) {
-				const t = Math.max(0, Math.min(1, (performance.now() - teleportStartMsRef.current) / teleportDurMsRef.current));
-				// easeInOutCubic
-				const tt = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-				pos = {
-					lat: teleportFromRef.current.lat + (teleportToRef.current.lat - teleportFromRef.current.lat) * tt,
-					lng: teleportFromRef.current.lng + (teleportToRef.current.lng - teleportFromRef.current.lng) * tt,
-				};
-				if (t >= 1) {
-					teleportStartMsRef.current = null;
-					teleportFromRef.current = null;
-					teleportToRef.current = null;
+			// Interpolate position at (server time - renderDelay)
+			const serverNow = Date.now() + clockSkewMsRef.current;
+			const targetT = serverNow - renderDelayMsRef.current;
+			const buf = samplesRef.current;
+			if (buf.length === 0) {
+				// nothing; keep previous
+			} else if (buf.length === 1) {
+				setDisplay({ lat: buf[0].lat, lng: buf[0].lng });
+			} else {
+				// find bracket
+				let i = 1;
+				while (i < buf.length && buf[i].t < targetT) i++;
+				if (i === 1 && targetT < buf[0].t) {
+					setDisplay({ lat: buf[0].lat, lng: buf[0].lng });
+				} else if (i >= buf.length) {
+					const lastS = buf[buf.length - 1];
+					setDisplay({ lat: lastS.lat, lng: lastS.lng });
+				} else {
+					const s0 = buf[i - 1];
+					const s1 = buf[i];
+					const t = Math.max(0, Math.min(1, (targetT - s0.t) / Math.max(1, (s1.t - s0.t))));
+					const lat = s0.lat + (s1.lat - s0.lat) * t;
+					const lng = s0.lng + (s1.lng - s0.lng) * t;
+					setDisplay({ lat, lng });
 				}
 			}
-			setDisplay(pos);
 			rafIdRef.current = requestAnimationFrame(loop);
 		};
 		rafIdRef.current = requestAnimationFrame(loop);
@@ -413,149 +435,13 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 			rafIdRef.current = null;
 		};
 	// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [routeParam, point?.lat, point?.lng]);
+	}, []);
 
-	// On route change, re-project current head to the new route to avoid jumps
-	useEffect(() => {
-		if (!routeParam) return;
-		const head = display || (point && typeof point.lat === 'number' && typeof point.lng === 'number' ? { lat: point.lat, lng: point.lng } : null);
-		if (!head) return;
-		const proj = routeParam.projectPointToS(head.lat, head.lng);
-		// Plan a short teleport-blend from current visual position to the nearest point on the new route
-		const to = routeParam.positionAtS(proj.s);
-		if (display) {
-			teleportFromRef.current = display;
-			teleportToRef.current = to;
-			// Duration based on distance (15–1000ms per 10m, clamped 500–1400ms)
-			const mPerDegLat = 111132.0;
-			const mPerDegLng = 111320.0 * Math.cos((display.lat * Math.PI) / 180);
-			const dx = (to.lng - display.lng) * mPerDegLng;
-			const dy = (to.lat - display.lat) * mPerDegLat;
-			const dist = Math.sqrt(dx * dx + dy * dy);
-			teleportDurMsRef.current = Math.max(500, Math.min(1400, (dist / 10) * 150));
-			teleportStartMsRef.current = performance.now();
-		}
-		// Align s targets to the new route; rAF will render using teleport blend
-		currentSRef.current = proj.s;
-		desiredSRef.current = proj.s;
-		desiredTargetSRef.current = proj.s;
-	// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [routeParam]);
+	// No route snapping/reprojection: we keep raw samples only
 
-	// On each live ping: project onto path, estimate speed, update targets
-	useEffect(() => {
-		if (!point) return;
-		// Update clock skew (EMA) from server timestamp if present
-		if (point.ts) {
-			const serverMs = new Date(point.ts).getTime();
-			const offset = serverMs - Date.now();
-			clockSkewMsRef.current = clockSkewMsRef.current * 0.9 + offset * 0.1;
-		}
-		if (!routeParam || typeof point.lat !== 'number' || typeof point.lng !== 'number') {
-			// Without a route, just snap display; rAF fallback will keep it steady
-			setDisplay({ lat: point.lat as number, lng: point.lng as number });
-			return;
-		}
-		const proj = routeParam.projectPointToS(point.lat!, point.lng!);
-		const sPing = proj.s;
-		const serverNow = point.ts ? new Date(point.ts).getTime() : (Date.now() + clockSkewMsRef.current);
-		let vPing = typeof point.speed === 'number' ? Math.max(0, Math.min(point.speed || 0, 50)) : 0;
-		if (!vPing && prevSPingRef.current != null && prevPingServerMsRef.current != null) {
-			const ds = sPing - prevSPingRef.current;
-			const dt = Math.max(0.2, (serverNow - prevPingServerMsRef.current) / 1000);
-			vPing = Math.max(0, Math.min(50, ds / dt));
-		}
-		prevSPingRef.current = sPing;
-		prevPingServerMsRef.current = serverNow;
-		// Smooth speed with EMA to reduce jitter
-		emaSpeedRef.current = emaSpeedRef.current === 0 ? vPing : (emaSpeedRef.current * 0.85 + vPing * 0.15);
-		const vSmoothed = Math.max(0, Math.min(50, emaSpeedRef.current));
-		const leadSec = 0.9;
-		// Update stationary detector history
-		{
-			const nowT = serverNow;
-			const hist = sHistRef.current;
-			hist.push({ s: sPing, t: nowT });
-			// trim to last ~10s
-			while (hist.length > 0 && nowT - hist[0].t > 10000) hist.shift();
-			// compute displacement over dispWindowSec
-			const windowStartT = nowT - dispWindowSecRef.current * 1000;
-			let minS = sPing;
-			for (let i = hist.length - 1; i >= 0; i--) {
-				if (hist[i].t < windowStartT) break;
-				if (hist[i].s < minS) minS = hist[i].s;
-			}
-			const disp = Math.max(0, sPing - minS);
-			const stationary = (vSmoothed < speedThreshRef.current) && (disp < dispMetersThreshRef.current);
-			isStationaryRef.current = stationary;
-		}
-		// Apply gating
-		if (isStationaryRef.current) {
-			desiredVRef.current = 0;
-			desiredTargetSRef.current = sPing; // no lookahead when stationary
-		} else {
-			desiredVRef.current = vSmoothed;
-			// Ease target in the rAF loop by updating desiredTargetS only
-			desiredTargetSRef.current = sPing + vSmoothed * leadSec;
-		}
-		// If correction is very large (e.g., GPS jump), blend visually instead of snapping
-		const bigJump = Math.abs(desiredTargetSRef.current - currentSRef.current) > 120; // meters
-		if (bigJump && routeParam && display) {
-			const to = routeParam.positionAtS(sPing);
-			teleportFromRef.current = display;
-			teleportToRef.current = to;
-			const mPerDegLat = 111132.0;
-			const mPerDegLng = 111320.0 * Math.cos((display.lat * Math.PI) / 180);
-			const dx = (to.lng - display.lng) * mPerDegLng;
-			const dy = (to.lat - display.lat) * mPerDegLat;
-			const dist = Math.sqrt(dx * dx + dy * dy);
-			teleportDurMsRef.current = Math.max(450, Math.min(1200, (dist / 10) * 120));
-			teleportStartMsRef.current = performance.now();
-		}
-		// First-time initialization of display
-		if (!display) {
-			currentSRef.current = sPing;
-			desiredSRef.current = sPing;
-			desiredTargetSRef.current = sPing + vSmoothed * leadSec;
-			setDisplay(routeParam.positionAtS(sPing));
-		}
-	// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [point?.lat, point?.lng, point?.ts, routeParam]);
+	// No per-ping target planning; samples are buffered and interpolated in rAF
 
-	// Snap the animated display to the current route if within a small threshold
-	const snappedDisplay = useMemo(() => {
-		// If rendering along a route, avoid re-projecting per frame (prevents micro jitter)
-		if (!display || !point || point.status === 'paused' || ((point.route?.coordinates?.length || 0) >= 2)) return display;
-		const coords = point.route?.coordinates || [];
-		if (!coords || coords.length < 2) return display;
-		// Local equirectangular projection around current latitude
-		const refLat = display.lat * Math.PI / 180;
-		const mPerDegLat = 111132.0;
-		const mPerDegLng = 111320.0 * Math.cos(refLat);
-		const toXY = (p: { lat: number; lng: number }) => ({ x: p.lng * mPerDegLng, y: p.lat * mPerDegLat });
-		const toLL = (x: number, y: number) => ({ lat: y / mPerDegLat, lng: x / mPerDegLng });
-		const P = toXY(display);
-		let best = display;
-		let bestDist = Number.POSITIVE_INFINITY;
-		for (let i = 0; i < coords.length - 1; i++) {
-			const A = toXY(coords[i]);
-			const B = toXY(coords[i + 1]);
-			const vx = B.x - A.x, vy = B.y - A.y;
-			const vlen2 = vx * vx + vy * vy;
-			let t = vlen2 === 0 ? 0 : ((P.x - A.x) * vx + (P.y - A.y) * vy) / vlen2;
-			if (t < 0) t = 0;
-			if (t > 1) t = 1;
-			const sx = A.x + t * vx, sy = A.y + t * vy;
-			const dx = P.x - sx, dy = P.y - sy;
-			const dist = Math.sqrt(dx * dx + dy * dy); // meters in projected space
-			if (dist < bestDist) {
-				bestDist = dist;
-				const ll = toLL(sx, sy);
-				best = { lat: ll.lat, lng: ll.lng };
-			}
-		}
-		return bestDist <= 25 ? best : display; // 25m snap threshold
-	}, [display?.lat, display?.lng, point?.status, point?.route?.coordinates]);
+	// snappedDisplay is defined after activeRouteCoords and nearest-road effect
 
 	const waiting = (
 		<div className="absolute inset-0" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -572,33 +458,288 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const hasCoords = !!(point && typeof point.lat === 'number' && typeof point.lng === 'number');
 	const statusLabel = point?.status === 'paused' ? 'Paused' : hasCoords ? 'Online' : 'Offline';
 
-	// Compute a displayRoute that starts at the animated display position and trims the backend route up to the nearest point
+	// Choose active route: client override if present, else backend-provided route
+	const activeRouteCoords = useMemo(() => {
+		if (overrideRoute && overrideRoute.length > 1) return overrideRoute;
+		return (point?.route?.coordinates || []) as Array<{ lat: number; lng: number }>;
+	}, [overrideRoute, point?.route?.coordinates]);
+
+	// Fetch nearest road snap when no route is active (throttled)
+	useEffect(() => {
+		if (!display) return;
+		if (activeRouteCoords && activeRouteCoords.length >= 2) return; // route snapping covers this
+		const now = Date.now();
+		const minIntervalMs = 2000;
+		if (nearestFetchInFlightRef.current || (now - lastNearestAtRef.current) < minIntervalMs) return;
+		nearestFetchInFlightRef.current = true;
+		lastNearestAtRef.current = now;
+		(async () => {
+			try {
+				const url = `/api/roads/nearest?lat=${encodeURIComponent(display.lat)}&lng=${encodeURIComponent(display.lng)}`;
+				const r = await fetch(url);
+				const j = await r.json();
+				const lat = Number(j?.lat);
+				const lng = Number(j?.lng);
+				const meters = Number(j?.distance ?? j?.meters ?? 0);
+				if (isFinite(lat) && isFinite(lng) && isFinite(meters)) {
+					snappedRoadRef.current = { lat, lng, meters };
+				}
+			} catch {
+				// ignore
+			} finally {
+				nearestFetchInFlightRef.current = false;
+			}
+		})();
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [display?.lat, display?.lng, activeRouteCoords]);
+
+	// Snap the animated display to route (when present) or to nearest road (OSRM) within a small threshold
+	const snappedDisplay = useMemo(() => {
+		if (!display) return display;
+		// 1) If we have an active route, snap to its nearest segment when close enough
+		const route = activeRouteCoords as Array<{ lat: number; lng: number }>;
+		if (route && route.length >= 2 && point?.status !== 'paused') {
+			const toRad = (d: number) => (d * Math.PI) / 180;
+			const refLat = toRad(display.lat);
+			const mPerDegLat = 111132.0;
+			const mPerDegLng = 111320.0 * Math.cos(refLat);
+			const toXY = (q: { lat: number; lng: number }) => ({ x: q.lng * mPerDegLng, y: q.lat * mPerDegLat });
+			const toLL = (x: number, y: number) => ({ lat: y / mPerDegLat, lng: x / mPerDegLng });
+			const P = toXY(display);
+			let bestIdx = 0;
+			let bestT = 0;
+			let bestDist2 = Number.POSITIVE_INFINITY;
+			for (let i = 0; i < route.length - 1; i++) {
+				const A = toXY(route[i]);
+				const B = toXY(route[i + 1]);
+				const vx = B.x - A.x, vy = B.y - A.y;
+				const vlen2 = Math.max(1e-9, vx * vx + vy * vy);
+				let t = ((P.x - A.x) * vx + (P.y - A.y) * vy) / vlen2;
+				if (t < 0) t = 0;
+				if (t > 1) t = 1;
+				const sx = A.x + t * vx, sy = A.y + t * vy;
+				const dx = P.x - sx, dy = P.y - sy;
+				const d2 = dx * dx + dy * dy;
+				if (d2 < bestDist2) {
+					bestDist2 = d2;
+					bestIdx = i;
+					bestT = t;
+				}
+			}
+			const A = toXY(route[bestIdx]);
+			const B = toXY(route[bestIdx + 1]);
+			const sx = A.x + (B.x - A.x) * bestT;
+			const sy = A.y + (B.y - A.y) * bestT;
+			const meters = Math.sqrt((P.x - sx) * (P.x - sx) + (P.y - sy) * (P.y - sy));
+			if (meters <= 25) {
+				const snapped = toLL(sx, sy);
+				return { lat: snapped.lat, lng: snapped.lng };
+			}
+		}
+		// 2) Otherwise, if we have a recent nearest-road snap within threshold, use it
+		if (snappedRoadRef.current && snappedRoadRef.current.meters <= 25) {
+			return { lat: snappedRoadRef.current.lat, lng: snappedRoadRef.current.lng };
+		}
+		// 3) Default to raw display
+		return display;
+	}, [display?.lat, display?.lng, point?.status, activeRouteCoords]);
+
+	// Compute a displayRoute that begins at the current head (no route snapping)
 	const displayRoute = useMemo(() => {
 		if (!point || point.status === 'paused') return [] as Array<[number, number]>;
-		const routeCoords = point.route?.coordinates || [];
+		const routeCoords = activeRouteCoords;
 		if (!routeCoords || routeCoords.length === 0) return [] as Array<[number, number]>;
 		const head = snappedDisplay || display || (hasCoords ? { lat: point.lat, lng: point.lng } : null);
 		if (!head) return [] as Array<[number, number]>;
-		// Find nearest index in the route to the current head
+		// Begin with head, then continue from nearest route coordinate (no projection)
 		let nearestIdx = 0;
 		let nearestScore = Number.POSITIVE_INFINITY;
 		for (let i = 0; i < routeCoords.length; i++) {
 			const dx = routeCoords[i].lat - head.lat;
 			const dy = routeCoords[i].lng - head.lng;
-			const score = dx * dx + dy * dy; // squared degrees distance; sufficient for choosing nearest index
+			const score = dx * dx + dy * dy;
 			if (score < nearestScore) {
 				nearestScore = score;
 				nearestIdx = i;
 			}
 		}
-		const trimmed: Array<[number, number]> = [];
-		trimmed.push([head.lat, head.lng]);
+		const trimmed: Array<[number, number]> = [[head.lat, head.lng]];
 		for (let i = nearestIdx + 1; i < routeCoords.length; i++) {
 			trimmed.push([routeCoords[i].lat, routeCoords[i].lng]);
 		}
 		return trimmed;
 	// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [point?.status, point?.route?.coordinates, display?.lat, display?.lng, hasCoords, point?.lat, point?.lng]);
+	}, [point?.status, activeRouteCoords, display?.lat, display?.lng, snappedDisplay?.lat, snappedDisplay?.lng, hasCoords, point?.lat, point?.lng]);
+
+	// Heading to display: prefer operator device heading (when moving), else derive from recent motion; no route-tangent fallback
+	const displayHeading = useMemo(() => {
+		// 1) Use device heading when available and reasonable speed
+		if (typeof point?.heading === 'number' && isFinite(point.heading)) {
+			const sp = (typeof point?.speed === 'number' && isFinite(point.speed!)) ? point!.speed! : null;
+			if (sp == null || sp >= 0.5) {
+				lastHeadingRef.current = point.heading!;
+				return point.heading!;
+			}
+		}
+		// 2) Derive from recent motion samples
+		const buf = samplesRef.current;
+		if (buf.length >= 2) {
+			const a = buf[buf.length - 2];
+			const b = buf[buf.length - 1];
+			// ignore tiny jitter
+			const dLat = b.lat - a.lat;
+			const dLng = b.lng - a.lng;
+			if (Math.abs(dLat) > 1e-7 || Math.abs(dLng) > 1e-7) {
+				const hdg = bearingDeg({ lat: a.lat, lng: a.lng }, { lat: b.lat, lng: b.lng });
+				lastHeadingRef.current = hdg;
+				return hdg;
+			}
+		}
+		// 3) Fallback to last known heading (if any)
+		return lastHeadingRef.current;
+	}, [point?.heading, point?.speed, display?.lat, display?.lng]);
+
+	// Compare two routes with a small spatial tolerance (meters)
+	const routesSimilar = (a?: Array<{ lat: number; lng: number }> | null, b?: Array<{ lat: number; lng: number }> | null, tolMeters: number = 15) => {
+		if (!a || !b) return false;
+		if (!Array.isArray(a) || !Array.isArray(b)) return false;
+		if (a.length < 2 || b.length < 2) return false;
+		const toRad = (d: number) => (d * Math.PI) / 180;
+		const R = 6371000;
+		const hav = (p1: { lat: number; lng: number }, p2: { lat: number; lng: number }) => {
+			const dLat = toRad(p2.lat - p1.lat);
+			const dLng = toRad(p2.lng - p1.lng);
+			const s1 = Math.sin(dLat / 2), s2 = Math.sin(dLng / 2);
+			const h = s1 * s1 + Math.cos(toRad(p1.lat)) * Math.cos(toRad(p2.lat)) * s2 * s2;
+			return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+		};
+		// Compare first and last few points to decide similarity quickly
+		const n = Math.min(5, Math.min(a.length, b.length));
+		for (let i = 0; i < n; i++) {
+			if (hav(a[i], b[i]) > tolMeters) return false;
+			if (hav(a[a.length - 1 - i], b[b.length - 1 - i]) > tolMeters) return false;
+		}
+		return true;
+	};
+
+	// If backend route changes (e.g., operator selected a new destination on Flutter), adopt it
+	// Only when no client override is active (avoid flicker between old/new)
+	useEffect(() => {
+		if (overrideRoute && overrideRoute.length > 0) return; // keep current override lock
+		const back = (point?.route?.coordinates || []) as Array<{ lat: number; lng: number }>;
+		if (!back || back.length < 2) return;
+		setOverrideRoute(back);
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [point?.route?.coordinates, overrideRoute?.length]);
+
+	const pulseIcon = useMemo(() => {
+		if (!leaflet) return null;
+		const arrow = (displayHeading != null)
+			? `<div class="heading-arrow" style="transform: translate(-50%,-50%) rotate(${displayHeading}deg) translate(0,-12px)"></div>`
+			: '';
+		return leaflet.divIcon({
+			className: 'pulse-icon',
+			html: `<div class="pulse-dot"></div>${arrow}`,
+			iconSize: [28, 28],
+			iconAnchor: [14, 14],
+			popupAnchor: [0, -12],
+		});
+	}, [leaflet, displayHeading]);
+
+	const pulseIconPaused = useMemo(() => {
+		if (!leaflet) return null;
+		const arrow = (displayHeading != null)
+			? `<div class="heading-arrow" style="transform: translate(-50%,-50%) rotate(${displayHeading}deg) translate(0,-12px)"></div>`
+			: '';
+		return leaflet.divIcon({
+			className: 'pulse-icon paused',
+			html: `<div class="pulse-dot"></div>${arrow}`,
+			iconSize: [28, 28],
+			iconAnchor: [14, 14],
+			popupAnchor: [0, -12],
+		});
+	}, [leaflet, displayHeading]);
+
+	// Recalculate route client-side if off-route and we have a destination (use last coordinate of current route)
+	useEffect(() => {
+		const now = Date.now();
+		if (!activeRouteCoords || activeRouteCoords.length < 2) return;
+		// Use the latest live sample (not delayed display) for immediate off-route detection
+		const buf = samplesRef.current;
+		const live = buf.length ? { lat: buf[buf.length - 1].lat, lng: buf[buf.length - 1].lng } : display;
+		if (!live) return;
+		// Destination inferred as last coord of current route
+		const dest = activeRouteCoords[activeRouteCoords.length - 1];
+		// Project live onto nearest route segment using local equirectangular projection
+		const toRad = (d: number) => (d * Math.PI) / 180;
+		const refLat = toRad(live.lat);
+		const mPerDegLat = 111132.0;
+		const mPerDegLng = 111320.0 * Math.cos(refLat);
+		const toXY = (p: { lat: number; lng: number }) => ({ x: p.lng * mPerDegLng, y: p.lat * mPerDegLat });
+		const P = toXY(live);
+		let bestIdx = 0;
+		let bestT = 0;
+		let bestDist2 = Number.POSITIVE_INFINITY;
+		for (let i = 0; i < activeRouteCoords.length - 1; i++) {
+			const A = toXY(activeRouteCoords[i]);
+			const B = toXY(activeRouteCoords[i + 1]);
+			const vx = B.x - A.x, vy = B.y - A.y;
+			const vlen2 = Math.max(1e-9, vx * vx + vy * vy);
+			let t = ((P.x - A.x) * vx + (P.y - A.y) * vy) / vlen2;
+			if (t < 0) t = 0;
+			if (t > 1) t = 1;
+			const sx = A.x + t * vx, sy = A.y + t * vy;
+			const dx = P.x - sx, dy = P.y - sy;
+			const d2 = dx * dx + dy * dy;
+			if (d2 < bestDist2) {
+				bestDist2 = d2;
+				bestIdx = i;
+				bestT = t;
+			}
+		}
+		const A = toXY(activeRouteCoords[bestIdx]);
+		const B = toXY(activeRouteCoords[bestIdx + 1]);
+		const sx = A.x + (B.x - A.x) * bestT;
+		const sy = A.y + (B.y - A.y) * bestT;
+		const nearestMeters = Math.sqrt((P.x - sx) * (P.x - sx) + (P.y - sy) * (P.y - sy));
+		// Route tangent heading at nearest segment
+		let angleDiff = 0;
+		if (displayHeading != null) {
+			const routeHdg = bearingDeg(
+				{ lat: A.y / mPerDegLat, lng: A.x / mPerDegLng },
+				{ lat: B.y / mPerDegLat, lng: B.x / mPerDegLng }
+			);
+			angleDiff = Math.abs(((displayHeading - routeHdg + 540) % 360) - 180);
+		}
+		const sp = (typeof point?.speed === 'number' && isFinite(point.speed!)) ? point!.speed! : null;
+		const isMoving = sp == null ? true : sp >= 0.8;
+		const severeMismatch = (displayHeading != null && angleDiff > 70 && (sp ?? 3) >= 2.5);
+		const distanceLarge = nearestMeters > 12 && isMoving;
+		const offRoute = severeMismatch || distanceLarge;
+		// Throttle fetches (shorter when severe mismatch)
+		const minIntervalMs = severeMismatch ? 1500 : 3000;
+		const throttleOk = (now - lastRouteFetchAtRef.current) > minIntervalMs;
+		if (offRoute && !routeFetchInFlightRef.current && throttleOk) {
+			routeFetchInFlightRef.current = true;
+			lastRouteFetchAtRef.current = now;
+			(async () => {
+				try {
+					const url = `/api/operator/route?from_lat=${encodeURIComponent(live.lat)}&from_lng=${encodeURIComponent(live.lng)}&to_lat=${encodeURIComponent(dest.lat)}&to_lng=${encodeURIComponent(dest.lng)}`;
+					const r = await fetch(url);
+					const j = await r.json();
+					const coords = (j?.coordinates || []) as Array<{ lat: number; lng: number }>;
+					if (Array.isArray(coords) && coords.length > 1) {
+						setOverrideRoute(coords);
+					}
+				} catch {
+					// ignore
+				} finally {
+					routeFetchInFlightRef.current = false;
+				}
+			})();
+		} 
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [display?.lat, display?.lng, activeRouteCoords, displayHeading, point?.speed, samplesRef.current.length]);
 
 	const infoOverlay = (
 		<div className="absolute left-0 right-0 bottom-0 p-0 sm:p-4 z-[401]" aria-live="polite">
@@ -692,11 +833,11 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 							pathOptions={{ color: (isDark ? '#ffffff' : '#000000'), weight: 4, opacity: 0.9 }}
 						/>
 					)}
-					{point?.status !== 'paused' && point?.route?.coordinates && point.route.coordinates.length > 0 && (
+					{point?.status !== 'paused' && activeRouteCoords && activeRouteCoords.length > 0 && (
 						<Marker
 							position={[
-								point.route.coordinates[point.route.coordinates.length - 1].lat,
-								point.route.coordinates[point.route.coordinates.length - 1].lng,
+								activeRouteCoords[activeRouteCoords.length - 1].lat,
+								activeRouteCoords[activeRouteCoords.length - 1].lng,
 							] as [number, number]}
 							icon={(destIcon || undefined) as any}
 						/>
@@ -746,6 +887,22 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 				.pulse-icon .pulse-dot::after { content: ''; position: absolute; left: 50%; top: 50%; width: 100%; height: 100%; border-radius: 9999px; transform: translate(-50%, -50%) scale(1); background: rgba(20, 184, 166, 0.35); animation: pulse-ring 1.8s ease-out infinite; }
 				.pulse-icon.paused .pulse-dot { background: #f59e0b; box-shadow: 0 0 0 rgba(245, 158, 11, 0.5); }
 				.pulse-icon.paused .pulse-dot::after { background: rgba(245, 158, 11, 0.35); }
+				/* Heading arrow (rotated via inline style; translation centers and lifts above dot) */
+				.pulse-icon .heading-arrow {
+					position: absolute;
+					left: 50%;
+					top: 50%;
+					width: 0;
+					height: 0;
+					border-left: 5px solid transparent;
+					border-right: 5px solid transparent;
+					border-bottom: 10px solid #14b8a6;
+					filter: drop-shadow(0 0 1px rgba(0,0,0,0.25));
+					pointer-events: none;
+				}
+				.pulse-icon.paused .heading-arrow {
+					border-bottom-color: #f59e0b;
+				}
 				.leaflet-div-icon.user-icon { background: transparent; border: none; }
 				.user-icon .user-dot { width: 14px; height: 14px; background: #3b82f6; border: 2px solid #ffffff; border-radius: 9999px; box-shadow: 0 0 0 rgba(59, 130, 246, 0.45); }
 				.leaflet-div-icon.dest-icon { background: transparent; border: none; }
@@ -753,6 +910,8 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 				@keyframes pulse-ring { 0% { transform: translate(-50%, -50%) scale(1); opacity: 0.75; } 100% { transform: translate(-50%, -50%) scale(2.8); opacity: 0; } }
 				/* Hide Leaflet attribution overlay if it renders */
 				.leaflet-control-attribution { display: none !important; }
+				/* Smooth marker movement by animating transform updates from Leaflet */
+				.leaflet-marker-icon { transition: transform 180ms linear; will-change: transform; }
 				/* Remove bottom radius on small screens and in-app webviews */
 				@media (max-width: 639px) {
 					.track-info-card { border-bottom-left-radius: 0 !important; border-bottom-right-radius: 0 !important; }

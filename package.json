@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "simulate:routeA": "node scripts/ghostRouteA.js"
+    "simulate:routeA": "node scripts/ghostRouteA.js",
+    "simulate:routeB": "END_LAT=42.314900 END_LNG=-83.036400 ROUTE_END_LAT=43.6159874 ROUTE_END_LNG=-79.7018163 node scripts/ghostRouteA.js"
   },
   "dependencies": {
     "@supabase/ssr": "^0.7.0",
