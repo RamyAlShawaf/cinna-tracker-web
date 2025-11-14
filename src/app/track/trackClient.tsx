@@ -73,8 +73,9 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	const animDurationMsRef = useRef<number>(900);
 	const centeredOnUserRef = useRef<boolean>(false);
 	const geoWatchIdRef = useRef<number | null>(null);
-	const routeFetchInFlightRef = useRef<boolean>(false);
-	const lastRouteFetchAtRef = useRef<number>(0);
+	// Lock backend adoption after client-side reroute to avoid oscillation
+	const routeLockUntilMsRef = useRef<number>(0);
+	const overrideSourceRef = useRef<'client' | 'backend' | null>(null);
 	// Throttle map recentering to avoid starting a new pan animation every frame
 	const lastPanAtRef = useRef<number>(0);
 	// Client override route remains active until superseded by a new reroute (never auto-cleared)
@@ -551,7 +552,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		if (!routeCoords || routeCoords.length === 0) return [] as Array<[number, number]>;
 		const head = snappedDisplay || display || (hasCoords ? { lat: point.lat, lng: point.lng } : null);
 		if (!head) return [] as Array<[number, number]>;
-		// Begin with head, then continue from nearest route coordinate (no projection)
+		// Begin with head, then continue from nearest route coordinate, choosing direction that best matches heading
 		let nearestIdx = 0;
 		let nearestScore = Number.POSITIVE_INFINITY;
 		for (let i = 0; i < routeCoords.length; i++) {
@@ -563,9 +564,51 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 				nearestIdx = i;
 			}
 		}
+		// Estimate current heading for direction choice
+		let heading: number | null = null;
+		if (typeof point?.heading === 'number' && isFinite(point.heading)) {
+			const sp = (typeof point?.speed === 'number' && isFinite(point.speed!)) ? point!.speed! : null;
+			if (sp == null || sp >= 0.5) heading = point.heading!;
+		}
+		if (heading == null) {
+			const buf = samplesRef.current;
+			if (buf.length >= 2) {
+				const a = buf[buf.length - 2];
+				const b = buf[buf.length - 1];
+				const dLat = b.lat - a.lat;
+				const dLng = b.lng - a.lng;
+				if (Math.abs(dLat) > 1e-7 || Math.abs(dLng) > 1e-7) {
+					heading = bearingDeg({ lat: a.lat, lng: a.lng }, { lat: b.lat, lng: b.lng });
+				}
+			}
+		}
+		if (heading == null && lastHeadingRef.current != null) {
+			heading = lastHeadingRef.current;
+		}
+		// Choose forward/backward by minimizing angular difference to heading, with small hysteresis
+		const angleDiff = (a: number, b: number) => Math.abs(((a - b + 540) % 360) - 180);
+		let forwardScore = Number.POSITIVE_INFINITY;
+		let backwardScore = Number.POSITIVE_INFINITY;
+		if (heading != null) {
+			if (nearestIdx < routeCoords.length - 1) {
+				forwardScore = angleDiff(heading, bearingDeg(routeCoords[nearestIdx], routeCoords[nearestIdx + 1]));
+			}
+			if (nearestIdx > 0) {
+				backwardScore = angleDiff(heading, bearingDeg(routeCoords[nearestIdx], routeCoords[nearestIdx - 1]));
+			}
+		} else {
+			forwardScore = 0; // default to forward if no heading
+		}
+		const preferBackward = backwardScore + 20 < forwardScore;
 		const trimmed: Array<[number, number]> = [[head.lat, head.lng]];
-		for (let i = nearestIdx + 1; i < routeCoords.length; i++) {
-			trimmed.push([routeCoords[i].lat, routeCoords[i].lng]);
+		if (!preferBackward) {
+			for (let i = nearestIdx + 1; i < routeCoords.length; i++) {
+				trimmed.push([routeCoords[i].lat, routeCoords[i].lng]);
+			}
+		} else {
+			for (let i = nearestIdx - 1; i >= 0; i--) {
+				trimmed.push([routeCoords[i].lat, routeCoords[i].lng]);
+			}
 		}
 		return trimmed;
 	// eslint-disable-next-line react-hooks/exhaustive-deps
@@ -625,12 +668,30 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 	// If backend route changes (e.g., operator selected a new destination on Flutter), adopt it
 	// Only when no client override is active (avoid flicker between old/new)
 	useEffect(() => {
-		if (overrideRoute && overrideRoute.length > 0) return; // keep current override lock
-		const back = (point?.route?.coordinates || []) as Array<{ lat: number; lng: number }>;
-		if (!back || back.length < 2) return;
-		setOverrideRoute(back);
+		const backend = (point?.route?.coordinates || []) as Array<{ lat: number; lng: number }>;
+		if (!backend || backend.length < 2) return;
+		const now = Date.now();
+		// If no current override, adopt backend route
+		if (!overrideRoute || overrideRoute.length < 2) {
+			setOverrideRoute(backend);
+			overrideSourceRef.current = 'backend';
+			return;
+		}
+		// If backend is similar to current override, it's safe to align with backend without causing flicker
+		if (routesSimilar(overrideRoute, backend, 15)) {
+			setOverrideRoute(backend);
+			overrideSourceRef.current = 'backend';
+			return;
+		}
+		// If current override originated from client reroute and the lock is active, avoid flipping back to backend
+		if (overrideSourceRef.current === 'client' && now < routeLockUntilMsRef.current) {
+			return;
+		}
+		// Lock expired or backend route is intentionally different; adopt backend
+		setOverrideRoute(backend);
+		overrideSourceRef.current = 'backend';
 	// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [point?.route?.coordinates, overrideRoute?.length]);
+	}, [point?.route?.coordinates, overrideRoute]);
 
 	const pulseIcon = useMemo(() => {
 		if (!leaflet) return null;
@@ -660,86 +721,7 @@ export default function TrackClient({ code, showInput = true }: TrackClientProps
 		});
 	}, [leaflet, displayHeading]);
 
-	// Recalculate route client-side if off-route and we have a destination (use last coordinate of current route)
-	useEffect(() => {
-		const now = Date.now();
-		if (!activeRouteCoords || activeRouteCoords.length < 2) return;
-		// Use the latest live sample (not delayed display) for immediate off-route detection
-		const buf = samplesRef.current;
-		const live = buf.length ? { lat: buf[buf.length - 1].lat, lng: buf[buf.length - 1].lng } : display;
-		if (!live) return;
-		// Destination inferred as last coord of current route
-		const dest = activeRouteCoords[activeRouteCoords.length - 1];
-		// Project live onto nearest route segment using local equirectangular projection
-		const toRad = (d: number) => (d * Math.PI) / 180;
-		const refLat = toRad(live.lat);
-		const mPerDegLat = 111132.0;
-		const mPerDegLng = 111320.0 * Math.cos(refLat);
-		const toXY = (p: { lat: number; lng: number }) => ({ x: p.lng * mPerDegLng, y: p.lat * mPerDegLat });
-		const P = toXY(live);
-		let bestIdx = 0;
-		let bestT = 0;
-		let bestDist2 = Number.POSITIVE_INFINITY;
-		for (let i = 0; i < activeRouteCoords.length - 1; i++) {
-			const A = toXY(activeRouteCoords[i]);
-			const B = toXY(activeRouteCoords[i + 1]);
-			const vx = B.x - A.x, vy = B.y - A.y;
-			const vlen2 = Math.max(1e-9, vx * vx + vy * vy);
-			let t = ((P.x - A.x) * vx + (P.y - A.y) * vy) / vlen2;
-			if (t < 0) t = 0;
-			if (t > 1) t = 1;
-			const sx = A.x + t * vx, sy = A.y + t * vy;
-			const dx = P.x - sx, dy = P.y - sy;
-			const d2 = dx * dx + dy * dy;
-			if (d2 < bestDist2) {
-				bestDist2 = d2;
-				bestIdx = i;
-				bestT = t;
-			}
-		}
-		const A = toXY(activeRouteCoords[bestIdx]);
-		const B = toXY(activeRouteCoords[bestIdx + 1]);
-		const sx = A.x + (B.x - A.x) * bestT;
-		const sy = A.y + (B.y - A.y) * bestT;
-		const nearestMeters = Math.sqrt((P.x - sx) * (P.x - sx) + (P.y - sy) * (P.y - sy));
-		// Route tangent heading at nearest segment
-		let angleDiff = 0;
-		if (displayHeading != null) {
-			const routeHdg = bearingDeg(
-				{ lat: A.y / mPerDegLat, lng: A.x / mPerDegLng },
-				{ lat: B.y / mPerDegLat, lng: B.x / mPerDegLng }
-			);
-			angleDiff = Math.abs(((displayHeading - routeHdg + 540) % 360) - 180);
-		}
-		const sp = (typeof point?.speed === 'number' && isFinite(point.speed!)) ? point!.speed! : null;
-		const isMoving = sp == null ? true : sp >= 0.8;
-		const severeMismatch = (displayHeading != null && angleDiff > 70 && (sp ?? 3) >= 2.5);
-		const distanceLarge = nearestMeters > 12 && isMoving;
-		const offRoute = severeMismatch || distanceLarge;
-		// Throttle fetches (shorter when severe mismatch)
-		const minIntervalMs = severeMismatch ? 1500 : 3000;
-		const throttleOk = (now - lastRouteFetchAtRef.current) > minIntervalMs;
-		if (offRoute && !routeFetchInFlightRef.current && throttleOk) {
-			routeFetchInFlightRef.current = true;
-			lastRouteFetchAtRef.current = now;
-			(async () => {
-				try {
-					const url = `/api/operator/route?from_lat=${encodeURIComponent(live.lat)}&from_lng=${encodeURIComponent(live.lng)}&to_lat=${encodeURIComponent(dest.lat)}&to_lng=${encodeURIComponent(dest.lng)}`;
-					const r = await fetch(url);
-					const j = await r.json();
-					const coords = (j?.coordinates || []) as Array<{ lat: number; lng: number }>;
-					if (Array.isArray(coords) && coords.length > 1) {
-						setOverrideRoute(coords);
-					}
-				} catch {
-					// ignore
-				} finally {
-					routeFetchInFlightRef.current = false;
-				}
-			})();
-		} 
-	// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [display?.lat, display?.lng, activeRouteCoords, displayHeading, point?.speed, samplesRef.current.length]);
+	// Web client does not compute reroutes; backend/Flutter publish the authoritative route
 
 	const infoOverlay = (
 		<div className="absolute left-0 right-0 bottom-0 p-0 sm:p-4 z-[401]" aria-live="polite">

@@ -48,6 +48,11 @@ const ROUTE_END = {
   lng: numEnv('ROUTE_END_LNG', MOVE_END.lng),
 };
 
+// Reroute thresholds
+const OFF_ROUTE_METERS = numEnv('OFF_ROUTE_METERS', 25); // consider off-route if >25m from current polyline
+const HEADING_MISMATCH_DEG = numEnv('HEADING_MISMATCH_DEG', 70); // consider off-route if heading differs too much
+const REROUTE_THROTTLE_MS = numEnv('REROUTE_THROTTLE_MS', 4000); // min gap between reroutes
+
 // Utilities
 function toRad(deg) { return (deg * Math.PI) / 180; }
 function toDeg(rad) { return (rad * 180) / Math.PI; }
@@ -114,6 +119,55 @@ async function getRoadRoute(start, end) {
   }
 }
 
+async function updateBackendRoute(token, coords) {
+  try {
+    const route = { coordinates: coords.map(p => ({ lat: p.lat, lng: p.lng })) };
+    const r = await fetch(`${BASE_URL}/api/operator/route/update?token=${encodeURIComponent(token)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ route }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      console.warn('[sim] route update failed:', r.status, text);
+    } else {
+      console.log(`[sim] published reroute with ${coords.length} points`);
+    }
+  } catch (e) {
+    console.warn('[sim] route update error:', e.message || e);
+  }
+}
+
+function nearestDistanceToPolylineMeters(point, polyline) {
+  if (!Array.isArray(polyline) || polyline.length < 2) return Infinity;
+  let best = Infinity;
+  for (let i = 0; i < polyline.length - 1; i++) {
+    const a = polyline[i];
+    const b = polyline[i + 1];
+    const d = distancePointToSegmentMeters(point, a, b);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+function distancePointToSegmentMeters(p, a, b) {
+  // Equirectangular approximation in meters around reference latitude
+  const refLat = ((a.lat + b.lat) / 2) * (Math.PI / 180);
+  const mPerDegLat = 111132.0;
+  const mPerDegLng = 111320.0 * Math.cos(refLat);
+  const ax = a.lng * mPerDegLng, ay = a.lat * mPerDegLat;
+  const bx = b.lng * mPerDegLng, by = b.lat * mPerDegLat;
+  const px = p.lng * mPerDegLng, py = p.lat * mPerDegLat;
+  const vx = bx - ax, vy = by - ay;
+  const wx = px - ax, wy = py - ay;
+  const vlen2 = vx * vx + vy * vy;
+  if (vlen2 <= 1e-12) return Math.hypot(px - ax, py - ay);
+  let t = (wx * vx + wy * vy) / vlen2;
+  if (t < 0) t = 0; else if (t > 1) t = 1;
+  const sx = ax + t * vx, sy = ay + t * vy;
+  return Math.hypot(px - sx, py - sy);
+}
+
 async function startSession() {
   const r = await fetch(`${BASE_URL}/api/operator/session/start`, {
     method: 'POST',
@@ -168,15 +222,44 @@ async function main() {
   console.log('[sim] done');
 }
 
-async function runOneLeg(token, moveCoords, routeCoords) {
+async function runOneLeg(token, moveCoords, initialRouteCoords) {
   // Publish along the provided coordinates
   // Include the full remaining route in each payload so web UI can render the polyline and destination
+  let routeCoords = initialRouteCoords.slice();
+  let lastRerouteAt = 0;
   for (let i = 0; i < moveCoords.length; i++) {
     const here = moveCoords[i];
     const next = moveCoords[Math.min(i + 1, moveCoords.length - 1)];
     const segDist = Math.max(1, haversineMeters(here, next));
     const segHeading = bearingDeg(here, next);
     const dtSec = Math.max(0.8, segDist / speedMps()); // time to next point at current speed
+    // Off-route detection (distance to current route + heading mismatch heuristic)
+    const distToRoute = nearestDistanceToPolylineMeters(here, routeCoords);
+    let headingMismatch = 0;
+    if (routeCoords.length >= 2) {
+      // Compare against local route tangent near nearest vertex
+      const idx = Math.max(0, Math.min(routeCoords.length - 2, Math.floor((i / moveCoords.length) * (routeCoords.length - 1))));
+      const routeHead = routeCoords[idx];
+      const routeNext = routeCoords[idx + 1];
+      const routeHdg = bearingDeg(routeHead, routeNext);
+      const diff = Math.abs(((segHeading - routeHdg + 540) % 360) - 180);
+      headingMismatch = diff;
+    }
+    const nowMs = Date.now();
+    const shouldReroute = (distToRoute > OFF_ROUTE_METERS || headingMismatch > HEADING_MISMATCH_DEG) && (nowMs - lastRerouteAt >= REROUTE_THROTTLE_MS);
+    if (shouldReroute) {
+      try {
+        const newRoute = await getRoadRoute(here, ROUTE_END);
+        if (Array.isArray(newRoute) && newRoute.length >= 2) {
+          routeCoords = newRoute;
+          lastRerouteAt = nowMs;
+          // Publish the new authoritative route to backend so all clients reflect it
+          await updateBackendRoute(token, routeCoords);
+        }
+      } catch (e) {
+        console.warn('[sim] reroute failed:', e.message || e);
+      }
+    }
     // Provide the full route polyline; the web trims it client-side near the current head.
     const route = { coordinates: routeCoords.map(p => ({ lat: p.lat, lng: p.lng })) };
     const sample = {
